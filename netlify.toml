@@ -1,0 +1,48 @@
+# Netlify deploy configuration for Founder OS.
+#
+# --- Build config ---
+# No build step by design — this is deployed exactly as authored
+# (plain HTML5/CSS3/vanilla JS, no frameworks, no bundler).
+[build]
+  command = ""
+  publish = "."
+
+# --- Caching strategy, and an honest tradeoff ---
+# Founder OS is currently a single self-contained index.html (all CSS
+# and JS inline, no separate js/css/data folders) — so unlike the
+# Brand OS template this is adapted from, there's only one app file to
+# think about, plus the assets/fonts folder for self-hosted type.
+# Plan:
+#   - index.html and version.json: no-cache, must-revalidate — always
+#     re-checked with the server before use. This is what would let an
+#     update-checker reliably detect a new deploy, IF Founder OS grows
+#     one — as of this version there is no such checker yet, since
+#     there's no separate app.js to hold it. version.json is still
+#     wired up now so that piece is ready whenever that's added.
+#   - assets (fonts, and any future images): cached longer (24 hours),
+#     since these change far less often than the app file itself.
+#
+# If Founder OS is later split into separate js/css/data files, add
+# matching [[headers]] blocks for those paths at that time (5 minute
+# max-age, must-revalidate, same pattern as Brand OS).
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache, must-revalidate"
+
+[[headers]]
+  for = "/version.json"
+  [headers.values]
+    Cache-Control = "no-cache, must-revalidate"
+
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=86400, must-revalidate"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
