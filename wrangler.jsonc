@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "founderos",
-  "compatibility_date": "2026-08-29" // auto-deploy test,
+  "compatibility_date": "2026-08-29" // auto-deploy test 2,
   "assets": {
     "directory": "./",
     "not_found_handling": "single-page-application",
