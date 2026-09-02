@@ -3655,6 +3655,17 @@ async function syncWithDrive(opts){
     if(!silent) showToast("Connect Google in Settings first");
     return;
   }
+  // The "Connected" flag is remembered from a previous session, but the
+  // live token grant is intentionally never persisted (see the top-of-file
+  // note on CALSYNC) — it resets on every page reload. If this session
+  // never actually connected yet, silently reconnect first instead of
+  // failing with a confusing "isn't connected" error; connectGoogleCalendar
+  // already re-runs the sync itself once the fresh sign-in completes.
+  if(!CALSYNC.google.tokenClient){
+    if(!silent) showToast("Reconnecting to Google…");
+    connectGoogleCalendar();
+    return;
+  }
   if(driveSyncInFlight) return;
   driveSyncInFlight = true;
   if(!silent) showToast("Syncing…");
