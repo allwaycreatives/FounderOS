@@ -1233,7 +1233,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 13,
+  SCHEMA_VERSION: 14,
   APP_NAME: "Founder OS",
   APP_SUB: "Command Center",
   CURRENT_VERSION_LABEL: "v0.3 · Relationships & Notes",
@@ -1613,6 +1613,7 @@ function ContentItemModel(overrides){
     dueDate: null, // when it needs to be ready
     publishDate: null, // when it actually/should go live
     notes: "",
+    notionPageId: null, // set after the first successful push to Notion; presence means "update" instead of "create" next time
     createdAt: Date.now(),
   }, overrides);
 }
@@ -1821,6 +1822,10 @@ function getDefaultState(){
     integrations: {
       google: { clientId: "", connected: false, accountEmail: "" },
       microsoft: { clientId: "", tenantId: "common", connected: false, accountEmail: "" },
+      // Notion has no client-side token: the app never sees it, calls go
+      // through this Worker's own /api/notion/* proxy. databaseId is not a
+      // secret, safe to keep in localStorage same as everything else here.
+      notion: { databaseId: "", connected: false, databaseTitle: "" },
     },
     missionTemplates: defaultMissionTemplates(), // Reusable mission checklists (Edit Reel, Client Onboarding, etc.)
     meta: { firstLaunchAt: Date.now(), lastOpenedAt: Date.now(), onboardingComplete: false, startedFromDemo: false, tourActive: false, tourStepIndex: 0 },
@@ -2026,6 +2031,18 @@ function migrateState(state){
       microsoft: { clientId: "", tenantId: "common", connected: false, accountEmail: "" },
     };
     state.schemaVersion = 13;
+  }
+  // v13 -> v14: Notion sync for Content Pipeline items, proxied through this
+  // Worker's own /api/notion/* route (see worker.js) since Notion's API has
+  // no CORS support and can't be called directly from the browser. Only a
+  // Database ID is stored client-side — the actual secret token lives only
+  // as a Worker environment secret, never in this app's state.
+  if(state.schemaVersion < 14){
+    if(!state.integrations.notion) state.integrations.notion = { databaseId: "", connected: false, databaseTitle: "" };
+    state.contentItems.forEach(c => {
+      if(c.notionPageId === undefined) c.notionPageId = null;
+    });
+    state.schemaVersion = 14;
   }
   return state;
 }
@@ -3316,6 +3333,97 @@ async function refreshMergedEvents(){
   }
   CALSYNC_CACHE.loading = false;
   renderApp();
+}
+
+/* ==========================================================================
+   SECTION: NOTION SYNC (Content Pipeline)
+   Unlike Google/Microsoft, there is no client-side OAuth here — Notion's
+   API doesn't support CORS, so the browser can never call it directly, and
+   Notion's OAuth also requires a server-side client-secret exchange, which
+   this file (deliberately) never holds. Instead, every call goes through
+   this Worker's own /api/notion/* route (see worker.js in the repo), which
+   holds the one real secret as a Worker environment variable and forwards
+   requests server-to-server. Only a Database ID (not a secret) lives here.
+   Same "never cache remote data locally" principle as Calendar Sync: the
+   database schema is re-fetched on every push rather than stored, so a
+   renamed/added Notion property is picked up automatically next time.
+   ========================================================================== */
+async function notionApiFetch(path, options){
+  const res = await fetch(`/api/notion${path}`, {
+    method: (options && options.method) || "GET",
+    headers: { "Content-Type": "application/json" },
+    body: options && options.body ? JSON.stringify(options.body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if(!res.ok) throw new Error(data.message || data.error || `Notion request failed (${res.status})`);
+  return data;
+}
+async function testNotionConnection(){
+  const dbId = STATE.integrations.notion.databaseId.trim();
+  if(!dbId){ showToast("Enter a Notion Database ID first"); return; }
+  try{
+    const db = await notionApiFetch(`/databases/${dbId}`);
+    const title = (db.title && db.title[0] && db.title[0].plain_text) || "(untitled database)";
+    STATE.integrations.notion.connected = true;
+    STATE.integrations.notion.databaseTitle = title;
+    saveState();
+    showToast(`Connected to Notion database "${title}"`);
+  }catch(err){
+    STATE.integrations.notion.connected = false;
+    saveState();
+    showToast(`Couldn't connect: ${err.message || err}`);
+  }
+  renderApp();
+}
+// Finds the best-matching property name for a given purpose by looking at
+// the database's actual schema — avoids hardcoding exact property names,
+// since every Notion workspace names things differently.
+function findNotionProperty(schema, type, nameHints){
+  const entries = Object.entries(schema);
+  for(const hint of nameHints){
+    const hit = entries.find(([name, def]) => def.type === type && name.toLowerCase().includes(hint));
+    if(hit) return hit[0];
+  }
+  const anyOfType = entries.find(([, def]) => def.type === type);
+  return anyOfType ? anyOfType[0] : null;
+}
+async function pushContentItemToNotion(item){
+  const dbId = STATE.integrations.notion.databaseId.trim();
+  if(!dbId){ showToast("Connect Notion in Settings first"); return; }
+  try{
+    const db = await notionApiFetch(`/databases/${dbId}`);
+    const schema = db.properties || {};
+    const titleProp = findNotionProperty(schema, "title", ["name", "title"]);
+    const selectProp = findNotionProperty(schema, "select", ["stage", "status"]);
+    const dateProp = findNotionProperty(schema, "date", ["publish", "due", "date"]);
+    const platformProp = findNotionProperty(schema, "select", ["platform"]) || findNotionProperty(schema, "multi_select", ["platform"]);
+
+    const properties = {};
+    if(titleProp) properties[titleProp] = { title: [{ text: { content: item.title } }] };
+    if(selectProp) properties[selectProp] = { select: { name: item.stage[0].toUpperCase() + item.stage.slice(1) } };
+    if(dateProp){
+      const d = item.publishDate || item.dueDate;
+      properties[dateProp] = { date: d ? { start: new Date(d).toISOString().slice(0, 10) } : null };
+    }
+    if(platformProp){
+      const propType = schema[platformProp].type;
+      properties[platformProp] = propType === "multi_select"
+        ? { multi_select: [{ name: item.platform }] }
+        : { select: { name: item.platform } };
+    }
+
+    if(item.notionPageId){
+      await notionApiFetch(`/pages/${item.notionPageId}`, { method: "PATCH", body: { properties } });
+      showToast(`Updated "${item.title}" in Notion`);
+    }else{
+      const page = await notionApiFetch(`/pages`, { method: "POST", body: { parent: { database_id: dbId }, properties } });
+      item.notionPageId = page.id;
+      saveState();
+      showToast(`Pushed "${item.title}" to Notion`);
+    }
+  }catch(err){
+    showToast(`Notion push failed: ${err.message || err}`);
+  }
 }
 
 /* ==========================================================================
@@ -5631,6 +5739,23 @@ function renderSettings(){
       </div>
 
       <div class="card glass col-12">
+        <h3 class="card-title"><span class="card-icon">${icon("content")}</span>Integrations — Notion (Content Pipeline)</h3>
+        <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);">
+          Different mechanism than Google/Microsoft above: there's no sign-in popup here. This app never holds a Notion token — pushes go through a small proxy built into this app's own Worker, which holds the real secret server-side. That secret is set once in the Cloudflare dashboard (Settings > Variables and Secrets > NOTION_TOKEN on the founderos Worker), not here.
+        </div>
+        <div class="settings-section">
+          <div class="settings-row" style="align-items:flex-start;">
+            <div style="flex:1;">
+              <div class="settings-row-label">Content Database</div>
+              <div class="settings-row-desc" style="margin-bottom:8px;">${STATE.integrations.notion.connected ? `Connected — "${escapeHtml(STATE.integrations.notion.databaseTitle || "")}"` : "Not connected."}</div>
+              <input class="field-input" id="notionDbIdInput" placeholder="Notion Database ID (from the database's share link)" value="${escapeHtml(STATE.integrations.notion.databaseId)}" style="margin-bottom:8px;max-width:420px;" />
+            </div>
+            <button class="btn btn-primary btn-sm" data-action="test-notion-connection">Test connection</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card glass col-12">
         <h3 class="card-title" style="color: var(--red)">Danger Zone</h3>
         <div class="danger-zone" style="display:flex; align-items:center; justify-content:space-between; gap: var(--space-4); flex-wrap: wrap;">
           <div>
@@ -6388,6 +6513,23 @@ function bindEvents(){
   const disconnectMsBtn = document.querySelector('[data-action="disconnect-microsoft"]');
   if(disconnectMsBtn) disconnectMsBtn.addEventListener("click", disconnectMicrosoftCalendar);
 
+  const notionDbIdInput = document.getElementById("notionDbIdInput");
+  if(notionDbIdInput){
+    notionDbIdInput.addEventListener("change", () => {
+      STATE.integrations.notion.databaseId = notionDbIdInput.value.trim();
+      STATE.integrations.notion.connected = false; // require a fresh Test connection after changing the ID
+      saveState();
+    });
+  }
+  const testNotionBtn = document.querySelector('[data-action="test-notion-connection"]');
+  if(testNotionBtn){
+    testNotionBtn.addEventListener("click", () => {
+      if(notionDbIdInput) STATE.integrations.notion.databaseId = notionDbIdInput.value.trim();
+      saveState();
+      testNotionConnection();
+    });
+  }
+
   const seasonChip = document.querySelector('[data-action="open-season-modal"]');
   if(seasonChip) seasonChip.addEventListener("click", () => openSeasonModal());
 
@@ -6683,6 +6825,7 @@ function renderContentPipeline(){
           </div>
           <div class="mission-card-actions">
             <select class="filter-select stage-select" data-action="move-content-stage" data-id="${c.id}">${stageOptionsHtml(c.stage)}</select>
+            ${STATE.integrations.notion.connected ? `<button class="icon-btn" data-action="push-content-notion" data-id="${c.id}" title="${c.notionPageId ? "Update in Notion" : "Push to Notion"}">${icon(c.notionPageId ? "refresh" : "send")}</button>` : ""}
             <button class="icon-btn" data-action="edit-content-item" data-id="${c.id}" title="Edit">${icon("edit")}</button>
             <button class="icon-btn" data-action="delete-content-item" data-id="${c.id}" title="Delete">${icon("trash")}</button>
           </div>
@@ -7076,6 +7219,16 @@ function openContentItemModal(item){
 function bindContentEvents(){
   const newBtn = document.querySelector('[data-action="new-content-item"]');
   if(newBtn) newBtn.addEventListener("click", () => openContentItemModal(null));
+
+  document.querySelectorAll('[data-action="push-content-notion"]').forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const item = contentItemById(btn.getAttribute("data-id"));
+      if(!item) return;
+      btn.disabled = true;
+      await pushContentItemToNotion(item);
+      renderApp();
+    });
+  });
 
   const pipelineTab = document.querySelector('[data-action="content-view-pipeline"]');
   if(pipelineTab){
