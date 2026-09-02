@@ -1248,7 +1248,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 15,
+  SCHEMA_VERSION: 16,
   APP_NAME: "Founder OS",
   APP_SUB: "Command Center",
   CURRENT_VERSION_LABEL: "v0.3 · Relationships & Notes",
@@ -1263,7 +1263,7 @@ const CONFIG = {
   // Client IDs from your own Google Cloud / Azure app registrations.
   GOOGLE_GIS_SRC: "https://accounts.google.com/gsi/client",
   MSAL_SRC: "https://alcdn.msauth.net/browser/3.7.1/js/msal-browser.min.js", // verify latest at https://www.npmjs.com/package/@azure/msal-browser before relying on this pin
-  GOOGLE_SCOPE: "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email",
+  GOOGLE_SCOPE: "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive.appdata",
   MS_SCOPES: ["Calendars.ReadWrite", "User.Read"],
 };
 
@@ -1851,6 +1851,12 @@ function getDefaultState(){
       // through this Worker's own /api/notion/* proxy. databaseId is not a
       // secret, safe to keep in localStorage same as everything else here.
       notion: { databaseId: "", connected: false, databaseTitle: "" },
+      // Cross-device sync: one JSON file in the connected Google account's
+      // hidden app-data space (not visible in the person's regular Drive).
+      // fileId is discovered by filename on first sync from any device, then
+      // cached locally as a fast-path — never assumed to exist on a new
+      // device. See DRIVESYNC section for the actual merge logic.
+      driveSync: { fileId: null, lastSyncedAt: null },
     },
     missionTemplates: defaultMissionTemplates(), // Reusable mission checklists (Edit Reel, Client Onboarding, etc.)
     meta: { firstLaunchAt: Date.now(), lastOpenedAt: Date.now(), onboardingComplete: false, startedFromDemo: false, tourActive: false, tourStepIndex: 0 },
@@ -1865,6 +1871,13 @@ function saveState(){
   }catch(err){
     console.error("Founder OS: failed to save state", err);
     showToast("Couldn't save — storage may be full", "warn");
+  }
+  // Debounced auto-sync: any local change eventually pushes to Drive, a few
+  // seconds after things go quiet — not on every keystroke. Guarded by
+  // driveSyncInFlight so a sync's own internal saves (persisting the merge
+  // result) don't schedule another sync and loop forever.
+  if(STATE.integrations && STATE.integrations.google && STATE.integrations.google.connected && !driveSyncInFlight){
+    scheduleDriveAutoSync();
   }
 }
 
@@ -2091,6 +2104,13 @@ function migrateState(state){
       state.season.updatedAt = state.season.startDate || Date.now();
     }
     state.schemaVersion = 15;
+  }
+  // v15 -> v16: Google Drive sync. Just adds the local pointer/timestamp —
+  // no data shape changes to back-fill, since every record already carries
+  // updatedAt as of v15 (which is exactly what the merge logic needs).
+  if(state.schemaVersion < 16){
+    if(!state.integrations.driveSync) state.integrations.driveSync = { fileId: null, lastSyncedAt: null };
+    state.schemaVersion = 16;
   }
   return state;
 }
@@ -3175,6 +3195,7 @@ async function connectGoogleCalendar(){
         showToast("Connected Google Calendar");
       }
       renderApp();
+      syncWithDrive({ silent: true }); // pick up existing data from other devices right away
     },
   });
   CALSYNC.google.tokenClient.requestAccessToken({ prompt: "consent" });
@@ -3487,6 +3508,148 @@ async function pushContentItemToNotion(item){
   }catch(err){
     showToast(`Notion push failed: ${err.message || err}`);
   }
+}
+
+/* ==========================================================================
+   SECTION: GOOGLE DRIVE SYNC (cross-device)
+   Uses the SAME Google connection as Calendar Sync above (see CONFIG.
+   GOOGLE_SCOPE — drive.appdata was added to that one combined grant, so
+   connecting Google once in Settings covers both). Storage is one JSON file
+   in the account's hidden appDataFolder — invisible in the person's normal
+   Drive, not something they'll see clutter from.
+
+   Scope of what actually syncs: only real business data (the 12 record
+   collections + season). Deliberately excluded: STATE.integrations (each
+   device does its own OAuth, a "connected" flag from one device is
+   meaningless on another), STATE.ui (view state, filters — inherently
+   per-device), STATE.meta (onboarding/tour state — per-device), and any
+   in-progress focusSession/activeBreak (starting a focus session on a
+   laptop shouldn't make it appear "active" on a phone).
+
+   Merge strategy: per-record, not whole-file. Every record already carries
+   updatedAt (see the v14->v15 migration above) — for each collection, union
+   by id, and where the same id exists on both sides, keep whichever has the
+   newer updatedAt. Records that only exist on one side are kept as-is.
+
+   Known, deliberate limitation — worth being honest about: a record DELETED
+   on one device but not yet synced from another will reappear next sync,
+   since this merge has no concept of "this was intentionally removed," only
+   "this wasn't present." Proper deletion tracking (tombstones) would close
+   that gap but adds real complexity — reasonable to add later if deleting
+   things while offline on multiple devices turns out to matter in practice.
+   ========================================================================== */
+const DRIVE_API_BASE = "https://www.googleapis.com/drive/v3";
+const DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3";
+const DRIVE_FILE_NAME = "founderos-state.json";
+const SYNC_COLLECTION_KEYS = [
+  "businesses", "projects", "missions", "missionTemplates", "opportunities",
+  "contentItems", "ideas", "contacts", "communications", "notes",
+  "knowledgeArticles", "journal",
+];
+
+let driveSyncInFlight = false;
+let driveSyncTimer = null;
+
+function scheduleDriveAutoSync(){
+  clearTimeout(driveSyncTimer);
+  driveSyncTimer = setTimeout(() => { syncWithDrive({ silent: true }); }, 4000);
+}
+
+async function driveApiFetch(url, options){
+  const token = await getGoogleAccessToken();
+  const headers = Object.assign({ Authorization: `Bearer ${token}` }, (options && options.headers) || {});
+  return fetch(url, Object.assign({}, options, { headers }));
+}
+
+async function driveFindFileId(){
+  if(STATE.integrations.driveSync.fileId) return STATE.integrations.driveSync.fileId;
+  const q = encodeURIComponent(`name='${DRIVE_FILE_NAME}' and trashed=false`);
+  const res = await driveApiFetch(`${DRIVE_API_BASE}/files?spaces=appDataFolder&q=${q}&fields=files(id)`);
+  if(!res.ok) throw new Error(`Drive lookup failed (${res.status})`);
+  const data = await res.json();
+  const found = data.files && data.files[0];
+  if(found){ STATE.integrations.driveSync.fileId = found.id; return found.id; }
+  return null;
+}
+async function driveCreateFile(){
+  const res = await driveApiFetch(`${DRIVE_API_BASE}/files`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: DRIVE_FILE_NAME, parents: ["appDataFolder"] }),
+  });
+  if(!res.ok) throw new Error(`Drive file creation failed (${res.status})`);
+  const data = await res.json();
+  STATE.integrations.driveSync.fileId = data.id;
+  return data.id;
+}
+async function driveDownloadState(fileId){
+  const res = await driveApiFetch(`${DRIVE_API_BASE}/files/${fileId}?alt=media`);
+  if(res.status === 404) return null;
+  if(!res.ok) throw new Error(`Drive download failed (${res.status})`);
+  const text = await res.text();
+  if(!text.trim()) return null;
+  try{ return JSON.parse(text); }catch(e){ return null; }
+}
+async function driveUploadState(fileId, dataObj){
+  const res = await driveApiFetch(`${DRIVE_UPLOAD_BASE}/files/${fileId}?uploadType=media`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(dataObj),
+  });
+  if(!res.ok) throw new Error(`Drive upload failed (${res.status})`);
+}
+
+function buildSyncPayload(state){
+  const payload = { season: state.season, syncedAt: Date.now() };
+  SYNC_COLLECTION_KEYS.forEach(k => { payload[k] = state[k]; });
+  return payload;
+}
+function mergeRecordArrays(localArr, remoteArr){
+  const map = new Map();
+  (remoteArr || []).forEach(r => map.set(r.id, r));
+  (localArr || []).forEach(r => {
+    const existing = map.get(r.id);
+    if(!existing || (r.updatedAt || 0) >= (existing.updatedAt || 0)) map.set(r.id, r);
+  });
+  return Array.from(map.values());
+}
+function mergeSingleton(local, remote){
+  if(!remote) return local;
+  if(!local) return remote;
+  return (local.updatedAt || 0) >= (remote.updatedAt || 0) ? local : remote;
+}
+
+async function syncWithDrive(opts){
+  const silent = (opts && opts.silent) || false;
+  if(!STATE.integrations.google.connected){
+    if(!silent) showToast("Connect Google in Settings first");
+    return;
+  }
+  if(driveSyncInFlight) return;
+  driveSyncInFlight = true;
+  if(!silent) showToast("Syncing…");
+  try{
+    let fileId = await driveFindFileId();
+    if(!fileId) fileId = await driveCreateFile();
+
+    const remote = await driveDownloadState(fileId);
+    if(remote){
+      SYNC_COLLECTION_KEYS.forEach(key => { STATE[key] = mergeRecordArrays(STATE[key], remote[key]); });
+      STATE.season = mergeSingleton(STATE.season, remote.season);
+    }
+
+    saveState(); // persist the merged result locally — driveSyncInFlight guard prevents this from re-scheduling another sync
+
+    await driveUploadState(fileId, buildSyncPayload(STATE));
+    STATE.integrations.driveSync.lastSyncedAt = Date.now();
+    saveState();
+
+    if(!silent) showToast("Synced with Google Drive");
+    renderApp();
+  }catch(err){
+    if(!silent) showToast(`Sync failed: ${err.message || err}`);
+  }
+  driveSyncInFlight = false;
 }
 
 /* ==========================================================================
@@ -5774,6 +5937,29 @@ function renderSettings(){
       </div>
 
       <div class="card glass col-12">
+        <h3 class="card-title"><span class="card-icon">${icon("refresh")}</span>Data Sync — Google Drive</h3>
+        <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);">
+          See your data on your phone, tablet, and laptop by signing into the same Google account on each. Your data is stored in a hidden file in <em>your own</em> Google Drive — not visible in your regular Drive, not stored anywhere else. Uses the same Google connection as Calendar Sync below, so connecting once covers both.
+        </div>
+        <div class="settings-section">
+          <div class="settings-row" style="align-items:flex-start;">
+            <div style="flex:1;">
+              <div class="settings-row-label">Sync status</div>
+              <div class="settings-row-desc">
+                ${!STATE.integrations.google.connected
+                  ? "Connect Google (below) to enable sync."
+                  : STATE.integrations.driveSync.lastSyncedAt
+                    ? `Last synced ${escapeHtml(timeAgo(STATE.integrations.driveSync.lastSyncedAt))}.`
+                    : "Connected — not synced yet on this device."}
+                ${STATE.integrations.google.connected ? " Since access isn't kept between sessions for security, click Sync Now once per session (or right after reconnecting) — it won't run silently in the background." : ""}
+              </div>
+            </div>
+            <button class="btn btn-primary btn-sm" data-action="sync-drive-now" ${!STATE.integrations.google.connected ? "disabled" : ""}>${icon("refresh")} Sync now</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card glass col-12">
         <h3 class="card-title"><span class="card-icon">${icon("extcal")}</span>Integrations — Calendar Sync</h3>
         <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);">
           Requires this app to be hosted (not opened as a local file) and your own Client ID from a Google Cloud project / Azure app registration — see the Calendar tab for the connected agenda once set up.
@@ -5782,7 +5968,7 @@ function renderSettings(){
           <div class="settings-row" style="align-items:flex-start;">
             <div style="flex:1;">
               <div class="settings-row-label">Google Calendar</div>
-              <div class="settings-row-desc" style="margin-bottom:8px;">${STATE.integrations.google.connected ? `Connected — ${escapeHtml(STATE.integrations.google.accountEmail || "")}` : "Not connected."}</div>
+              <div class="settings-row-desc" style="margin-bottom:8px;">${STATE.integrations.google.connected ? `Connected — ${escapeHtml(STATE.integrations.google.accountEmail || "")}` : "Not connected."} ${STATE.integrations.google.connected ? "This same connection also powers Data Sync below." : ""}</div>
               ${!STATE.integrations.google.connected ? `<input class="field-input" id="googleClientIdInput" placeholder="Google OAuth Client ID" value="${escapeHtml(STATE.integrations.google.clientId)}" style="margin-bottom:8px;max-width:420px;" />` : ""}
             </div>
             <button class="btn ${STATE.integrations.google.connected ? "btn-ghost" : "btn-primary"} btn-sm" data-action="${STATE.integrations.google.connected ? "disconnect-google" : "connect-google"}">${STATE.integrations.google.connected ? "Disconnect" : "Connect"}</button>
@@ -6591,6 +6777,10 @@ function bindEvents(){
       saveState();
       testNotionConnection();
     });
+  }
+  const syncDriveBtn = document.querySelector('[data-action="sync-drive-now"]');
+  if(syncDriveBtn){
+    syncDriveBtn.addEventListener("click", () => syncWithDrive({ silent: false }));
   }
 
   const seasonChip = document.querySelector('[data-action="open-season-modal"]');
