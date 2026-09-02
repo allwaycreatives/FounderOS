@@ -2119,6 +2119,13 @@ function resetToSampleData(){
   STATE = generateSampleData();
   saveState();
 }
+// Genuinely empty, not demo-seeded — returns to the Welcome screen (and its
+// "Restore your console" option) rather than the main app. The real
+// recovery path for "I picked the demo by accident and meant to sync."
+function startCompletelyFresh(){
+  localStorage.removeItem(CONFIG.STORAGE_KEY);
+  STATE = getDefaultState();
+}
 
 function exportDataAsJSON(){
   try{
@@ -3195,10 +3202,33 @@ async function connectGoogleCalendar(){
         showToast("Connected Google Calendar");
       }
       renderApp();
-      syncWithDrive({ silent: true }); // pick up existing data from other devices right away
+      await handlePostConnectSync();
     },
   });
   CALSYNC.google.tokenClient.requestAccessToken({ prompt: "consent" });
+}
+// Shared by both entry points (Settings > Connect, and the Welcome screen's
+// "Restore your console" path). On a genuinely fresh device (onboarding not
+// yet complete), a successful sync that actually finds real records skips
+// onboarding entirely — that's the whole point of offering this before the
+// wizard. On an already-set-up device, this is just the normal "pick up
+// what changed elsewhere" sync.
+async function handlePostConnectSync(){
+  if(!STATE.meta.onboardingComplete){
+    await syncWithDrive({ silent: true });
+    const hasRealData = STATE.businesses.length > 0 || STATE.missions.length > 0 || STATE.projects.length > 0;
+    if(hasRealData){
+      STATE.meta.onboardingComplete = true;
+      STATE.meta.startedFromDemo = false;
+      saveState();
+      showToast("Restored your console from Google Drive");
+    }else{
+      showToast("Connected — no existing data found in Drive yet. Continue with setup below.");
+    }
+    renderApp();
+  }else{
+    syncWithDrive({ silent: true });
+  }
 }
 function disconnectGoogleCalendar(){
   if(CALSYNC.google.accessToken && window.google){
@@ -6013,6 +6043,13 @@ function renderSettings(){
           </div>
           <button class="btn btn-danger" data-action="reset-data">Reset console</button>
         </div>
+        <div class="danger-zone" style="display:flex; align-items:center; justify-content:space-between; gap: var(--space-4); flex-wrap: wrap; margin-top:var(--space-4);">
+          <div>
+            <div class="settings-row-label">Start completely fresh</div>
+            <div class="settings-row-desc">Wipes everything on this device and returns to the Welcome screen — including the "Restore your console" option, if you picked the demo by accident and meant to sync from another device instead.</div>
+          </div>
+          <button class="btn btn-danger" data-action="start-fresh">Start over</button>
+        </div>
       </div>
     </div>
   </div>`;
@@ -6112,6 +6149,7 @@ function renderOnboardingWelcome(){
         <button class="btn btn--primary" data-action="onboarding-start-wizard">Get Started</button>
         <button class="btn btn--secondary" data-action="onboarding-start-demo">Learn More</button>
       </div>
+      <button class="btn btn-ghost btn-sm" data-action="onboarding-restore-sync" style="margin-top:var(--space-4);">${icon("refresh")} Already set up on another device? Restore your console</button>
     </div>
   </div>`;
 }
@@ -6249,6 +6287,41 @@ function completeOnboardingWithWizard(){
   showToast(`Welcome, ${founder.name} — your console is ready`);
 }
 
+function openRestoreSyncModal(){
+  const savedClientId = STATE.integrations.google.clientId;
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">Restore your console</div>
+      <button class="modal-close" data-modal-close>${icon("close")}</button>
+    </div>
+    <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);line-height:1.6;">
+      If you've already set up Founder OS on another device and turned on Data Sync there, signing into the same Google account here will pull your real console down instead of starting over.
+    </div>
+    <form id="restoreSyncForm">
+      ${!savedClientId ? `
+      <div class="field">
+        <label class="field-label">Google OAuth Client ID</label>
+        <input class="field-input" id="restoreClientIdInput" placeholder="Same Client ID used on your other device" required />
+        <div style="font-size:12px;color:var(--text-tertiary);margin-top:4px;">One-time setup step — this isn't a password, just an app identifier. Find it in Settings > Data Sync on your other device, or your Google Cloud Console.</div>
+      </div>` : ""}
+      <div class="modal-footer">
+        <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">${icon("refresh")} Connect &amp; Restore</button>
+      </div>
+    </form>
+  `, (root) => {
+    root.querySelector("#restoreSyncForm").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const clientIdInput = root.querySelector("#restoreClientIdInput");
+      if(clientIdInput) STATE.integrations.google.clientId = clientIdInput.value.trim();
+      if(!STATE.integrations.google.clientId){ showToast("Enter the Client ID first"); return; }
+      saveState();
+      closeModal();
+      connectGoogleCalendar();
+    });
+  });
+}
+
 function bindOnboardingEvents(){
   const startWizardBtn = document.querySelector('[data-action="onboarding-start-wizard"]');
   if(startWizardBtn) startWizardBtn.addEventListener("click", () => {
@@ -6258,6 +6331,9 @@ function bindOnboardingEvents(){
   });
   const startDemoBtn = document.querySelector('[data-action="onboarding-start-demo"]');
   if(startDemoBtn) startDemoBtn.addEventListener("click", completeOnboardingWithDemo);
+
+  const restoreSyncBtn = document.querySelector('[data-action="onboarding-restore-sync"]');
+  if(restoreSyncBtn) restoreSyncBtn.addEventListener("click", openRestoreSyncModal);
 
   const backWelcome = document.querySelector('[data-action="onboarding-back-welcome"]');
   if(backWelcome) backWelcome.addEventListener("click", () => { STATE.ui.onboardingStep = "welcome"; saveState(); renderApp(); });
@@ -6711,6 +6787,15 @@ function bindEvents(){
         resetToSampleData();
         renderApp();
         showToast("Console reset to sample data");
+      }
+    });
+  }
+  const startFreshBtn = document.querySelector('[data-action="start-fresh"]');
+  if(startFreshBtn){
+    startFreshBtn.addEventListener("click", () => {
+      if(confirm("This will erase everything on this device and return to the Welcome screen. Continue?")){
+        startCompletelyFresh();
+        renderApp();
       }
     });
   }
