@@ -1233,7 +1233,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 14,
+  SCHEMA_VERSION: 15,
   APP_NAME: "Founder OS",
   APP_SUB: "Command Center",
   CURRENT_VERSION_LABEL: "v0.3 · Relationships & Notes",
@@ -1429,6 +1429,7 @@ function BusinessModel(overrides){
     status: "ontrack", // ontrack | attention | atrisk
     color: "blue",
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   }, overrides);
 }
 
@@ -1441,6 +1442,7 @@ function ProjectModel(overrides){
     description: "",
     status: "active", // active | onhold | completed
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   }, overrides);
 }
 
@@ -1459,6 +1461,7 @@ function MissionModel(overrides){
     completedAt: null, // set when status transitions to "completed"
     tasks: [],
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   }, overrides);
 }
 
@@ -1481,6 +1484,7 @@ function MissionTemplateModel(overrides){
     impactScore: 5, // 1-10
     tasks: [], // array of plain strings — turned into TaskModel rows when applied to a mission
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   }, overrides);
 }
 
@@ -1524,6 +1528,7 @@ function SeasonModel(overrides){
     name: "BUILD",
     startDate: Date.now(),
     durationMonths: 3,
+    updatedAt: Date.now(),
     objectives: [],
   }, overrides);
 }
@@ -1597,6 +1602,7 @@ function OpportunityModel(overrides){
     estimatedValue: 0, // optional deal size, 0 = not tracked
     notes: "",
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   }, overrides);
 }
 
@@ -1615,6 +1621,7 @@ function ContentItemModel(overrides){
     notes: "",
     notionPageId: null, // set after the first successful push to Notion; presence means "update" instead of "create" next time
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   }, overrides);
 }
 
@@ -1628,6 +1635,7 @@ function IdeaModel(overrides){
     status: "inbox", // inbox | assigned | archived
     projectId: null,
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   }, overrides);
 }
 
@@ -1681,6 +1689,7 @@ function ContactModel(overrides){
     nextFollowUpAt: null,
     notes: "", // freeform: "likes phone calls, prefers morning meetings"
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   }, overrides);
 }
 
@@ -1693,6 +1702,7 @@ function CommunicationModel(overrides){
     summary: "",
     occurredAt: Date.now(),
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   }, overrides);
 }
 
@@ -2043,6 +2053,29 @@ function migrateState(state){
       if(c.notionPageId === undefined) c.notionPageId = null;
     });
     state.schemaVersion = 14;
+  }
+  // v14 -> v15: updatedAt on every syncable record. This is the foundation
+  // for cross-device sync (Google Sign-In + per-record merge, in progress)
+  // — the sync logic needs a reliable "which version is newer" signal for
+  // every record type, and most of them never tracked this before. Backfill
+  // existing records using createdAt as the best available approximation;
+  // every record touched after this point gets a real one.
+  if(state.schemaVersion < 15){
+    const backfillList = [
+      state.businesses, state.projects, state.missions, state.missionTemplates,
+      state.opportunities, state.contentItems, state.ideas, state.contacts,
+      state.communications, state.notes, state.knowledgeArticles, state.journal,
+    ];
+    backfillList.forEach(arr => {
+      if(!Array.isArray(arr)) return;
+      arr.forEach(rec => {
+        if(rec.updatedAt === undefined) rec.updatedAt = rec.createdAt || Date.now();
+      });
+    });
+    if(state.season && state.season.updatedAt === undefined){
+      state.season.updatedAt = state.season.startDate || Date.now();
+    }
+    state.schemaVersion = 15;
   }
   return state;
 }
@@ -2621,7 +2654,7 @@ function createBusiness(data){
 function updateBusiness(id, data){
   const biz = STATE.businesses.find(b => b.id === id);
   if(!biz) return;
-  Object.assign(biz, data);
+  Object.assign(biz, data, { updatedAt: Date.now() });
   saveState();
 }
 function deleteBusiness(id){
@@ -2647,7 +2680,7 @@ function updateProject(id, data){
   const proj = projectById(id);
   if(!proj) return;
   const businessChanged = data.businessId && data.businessId !== proj.businessId;
-  Object.assign(proj, data);
+  Object.assign(proj, data, { updatedAt: Date.now() });
   if(businessChanged){
     missionsForProject(id).forEach(m => { m.businessId = proj.businessId; });
   }
@@ -2676,7 +2709,7 @@ function createMissionTemplate(data){
 function updateMissionTemplate(id, data){
   const tmpl = missionTemplateById(id);
   if(!tmpl) return;
-  Object.assign(tmpl, data);
+  Object.assign(tmpl, data, { updatedAt: Date.now() });
   saveState();
 }
 function deleteMissionTemplate(id){
@@ -2717,7 +2750,7 @@ function updateMission(id, data){
     if(data.status === "completed") data.completedAt = Date.now();
     else data.completedAt = null;
   }
-  Object.assign(mission, data);
+  Object.assign(mission, data, { updatedAt: Date.now() });
   saveState();
 }
 function deleteMission(id){
@@ -2734,6 +2767,7 @@ function addTask(missionId, title){
   if(!mission || !title.trim()) return;
   mission.tasks.push(TaskModel({ title: title.trim() }));
   mission.progress = computeMissionProgress(mission);
+  mission.updatedAt = Date.now();
   saveState();
 }
 function toggleTask(missionId, taskId){
@@ -2743,6 +2777,7 @@ function toggleTask(missionId, taskId){
   if(!task) return;
   task.done = !task.done;
   mission.progress = computeMissionProgress(mission);
+  mission.updatedAt = Date.now();
   if(task.done && mission.progress === 100 && mission.status === "active"){
     logActivity("mission", `Completed all tasks on <b>${escapeHtml(mission.title)}</b>`);
   }
@@ -2753,6 +2788,7 @@ function deleteTask(missionId, taskId){
   if(!mission) return;
   mission.tasks = mission.tasks.filter(t => t.id !== taskId);
   mission.progress = computeMissionProgress(mission);
+  mission.updatedAt = Date.now();
   saveState();
 }
 
@@ -2770,13 +2806,14 @@ function createOpportunity(data){
 function updateOpportunity(id, data){
   const opp = opportunityById(id);
   if(!opp) return;
-  Object.assign(opp, data);
+  Object.assign(opp, data, { updatedAt: Date.now() });
   saveState();
 }
 function moveOpportunityStage(id, stage){
   const opp = opportunityById(id);
   if(!opp || !OPPORTUNITY_STAGES.includes(stage)) return;
   opp.stage = stage;
+  opp.updatedAt = Date.now();
   logActivity("info", `Moved <b>${escapeHtml(opp.name)}</b> to ${stage[0].toUpperCase() + stage.slice(1)}`);
   saveState();
 }
@@ -2805,13 +2842,14 @@ function createContentItem(data){
 function updateContentItem(id, data){
   const item = contentItemById(id);
   if(!item) return;
-  Object.assign(item, data);
+  Object.assign(item, data, { updatedAt: Date.now() });
   saveState();
 }
 function moveContentStage(id, stage){
   const item = contentItemById(id);
   if(!item || !CONTENT_STAGES.includes(stage)) return;
   item.stage = stage;
+  item.updatedAt = Date.now();
   logActivity("info", `Moved <b>${escapeHtml(item.title)}</b> to ${stage[0].toUpperCase() + stage.slice(1)}`);
   saveState();
 }
@@ -2843,6 +2881,7 @@ function assignIdeaToProject(id, projectId){
   if(!idea) return;
   idea.projectId = projectId;
   idea.status = "assigned";
+  idea.updatedAt = Date.now();
   saveState();
 }
 function unassignIdea(id){
@@ -2850,18 +2889,21 @@ function unassignIdea(id){
   if(!idea) return;
   idea.projectId = null;
   idea.status = "inbox";
+  idea.updatedAt = Date.now();
   saveState();
 }
 function archiveIdea(id){
   const idea = ideaById(id);
   if(!idea) return;
   idea.status = "archived";
+  idea.updatedAt = Date.now();
   saveState();
 }
 function restoreIdea(id){
   const idea = ideaById(id);
   if(!idea) return;
   idea.status = idea.projectId ? "assigned" : "inbox";
+  idea.updatedAt = Date.now();
   saveState();
 }
 function deleteIdea(id){
@@ -2930,7 +2972,7 @@ function createContact(data){
 function updateContact(id, data){
   const contact = contactById(id);
   if(!contact) return;
-  Object.assign(contact, data);
+  Object.assign(contact, data, { updatedAt: Date.now() });
   saveState();
 }
 function deleteContact(id){
@@ -2953,6 +2995,7 @@ function logCommunication(contactId, data){
   STATE.communications.push(entry);
   if(!contact.lastContactAt || entry.occurredAt > contact.lastContactAt){
     contact.lastContactAt = entry.occurredAt;
+    contact.updatedAt = Date.now();
   }
   logActivity("info", `Logged a ${entry.type} with <b>${escapeHtml(contact.name)}</b>`);
   saveState();
@@ -2986,6 +3029,7 @@ function toggleNotePinned(id){
   const note = noteById(id);
   if(!note) return;
   note.pinned = !note.pinned;
+  note.updatedAt = Date.now();
   saveState();
 }
 function deleteNote(id){
@@ -3018,12 +3062,13 @@ function deleteKnowledgeArticle(id){
 /* ---- Season management ---- */
 function updateSeasonDetails(data){
   if(!STATE.season) return;
-  Object.assign(STATE.season, data);
+  Object.assign(STATE.season, data, { updatedAt: Date.now() });
   saveState();
 }
 function addSeasonObjective(text){
   if(!STATE.season || !text.trim()) return;
   STATE.season.objectives.push(ObjectiveModel({ text: text.trim() }));
+  STATE.season.updatedAt = Date.now();
   saveState();
 }
 function toggleSeasonObjective(objectiveId){
@@ -3031,11 +3076,13 @@ function toggleSeasonObjective(objectiveId){
   const obj = STATE.season.objectives.find(o => o.id === objectiveId);
   if(!obj) return;
   obj.done = !obj.done;
+  STATE.season.updatedAt = Date.now();
   saveState();
 }
 function deleteSeasonObjective(objectiveId){
   if(!STATE.season) return;
   STATE.season.objectives = STATE.season.objectives.filter(o => o.id !== objectiveId);
+  STATE.season.updatedAt = Date.now();
   saveState();
 }
 function startNewSeason(name, durationMonths){
@@ -3418,6 +3465,7 @@ async function pushContentItemToNotion(item){
     }else{
       const page = await notionApiFetch(`/pages`, { method: "POST", body: { parent: { database_id: dbId }, properties } });
       item.notionPageId = page.id;
+      item.updatedAt = Date.now();
       saveState();
       showToast(`Pushed "${item.title}" to Notion`);
     }
