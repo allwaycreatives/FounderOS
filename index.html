@@ -1189,6 +1189,21 @@ kbd{
   .choice-grid{ grid-template-columns: repeat(2, 1fr); }
   .onboarding-actions{ flex-direction: column-reverse; }
   .onboarding-actions .btn{ width: 100%; }
+
+  /* Card action rows (Missions, Content Pipeline, Templates, Knowledge,
+     Calendar Sync) — the icon/dropdown cluster on the right was staying
+     flex-shrink:0 and squeezing the title/meta area on narrow screens
+     instead of dropping to its own line. */
+  .mission-card-top{ flex-wrap: wrap; }
+  .mission-card-actions{ width: 100%; justify-content: flex-end; margin-top: 6px; }
+  .stage-select{ max-width: 130px; }
+
+  /* Settings rows with a long input + action button (Integrations:
+     Google/Microsoft/Notion) — was staying side-by-side and cramping the
+     input field. Stack them instead. */
+  .settings-row{ flex-wrap: wrap; }
+  .settings-row .field-input{ max-width: 100% !important; }
+  .settings-row > button{ width: 100%; }
 }
 
 /* Fade-in on view switch */
