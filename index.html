@@ -1248,7 +1248,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 16,
+  SCHEMA_VERSION: 17,
   APP_NAME: "Founder OS",
   APP_SUB: "Command Center",
   CURRENT_VERSION_LABEL: "v0.3 · Relationships & Notes",
@@ -1261,7 +1261,7 @@ const CONFIG = {
   // current, which self-hosting would defeat. Both are no-ops until this
   // app is hosted (not file://) and Settings > Integrations has real
   // Client IDs from your own Google Cloud / Azure app registrations.
-  GOOGLE_GIS_SRC: "https://accounts.google.com/gsi/client",
+  GOOGLE_GIS_SRC: "https://accounts.google.com/gsi/client", // no longer used — Google Calendar/Drive sign-in moved to a plain redirect (Authorization Code + PKCE) so a refresh token could be persisted; left here only in case GIS is needed again for something else later
   MSAL_SRC: "https://alcdn.msauth.net/browser/3.7.1/js/msal-browser.min.js", // verify latest at https://www.npmjs.com/package/@azure/msal-browser before relying on this pin
   GOOGLE_SCOPE: "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive.appdata",
   MS_SCOPES: ["Calendars.ReadWrite", "User.Read"],
@@ -1845,11 +1845,8 @@ function getDefaultState(){
     knowledgeArticles: defaultKnowledgeArticles(), // Knowledge Hub: SOPs, Lessons Learned, Reference docs
     contentItems: [], // Content Pipeline: idea -> scripting -> filming -> editing -> review -> scheduled -> published
     integrations: {
-      google: { clientId: "", connected: false, accountEmail: "" },
+      google: { clientId: "", connected: false, accountEmail: "", refreshToken: null },
       microsoft: { clientId: "", tenantId: "common", connected: false, accountEmail: "" },
-      // Notion has no client-side token: the app never sees it, calls go
-      // through this Worker's own /api/notion/* proxy. databaseId is not a
-      // secret, safe to keep in localStorage same as everything else here.
       notion: { databaseId: "", connected: false, databaseTitle: "" },
       // Cross-device sync: one JSON file in the connected Google account's
       // hidden app-data space (not visible in the person's regular Drive).
@@ -2111,6 +2108,14 @@ function migrateState(state){
   if(state.schemaVersion < 16){
     if(!state.integrations.driveSync) state.integrations.driveSync = { fileId: null, lastSyncedAt: null };
     state.schemaVersion = 16;
+  }
+  // v16 -> v17: persistent Google sign-in. Adds refreshToken to the Google
+  // integration record. Anyone upgrading from an older version simply has
+  // no refresh token yet — they'll reconnect once (via the new redirect
+  // flow) and get one from that point on, same as a first-time connect.
+  if(state.schemaVersion < 17){
+    if(state.integrations.google.refreshToken === undefined) state.integrations.google.refreshToken = null;
+    state.schemaVersion = 17;
   }
   return state;
 }
@@ -3138,10 +3143,14 @@ function startNewSeason(name, durationMonths){
    Everything here is a deliberate exception to this file's normal
    "self-contained, zero network requests" rule (see CONFIG comment above).
    Design choices, load-bearing for the rest of this section:
-     - Access tokens live ONLY in CALSYNC (below), never in STATE, so they
-       are never written to localStorage and never appear in an exported
-       state file. Reconnecting is required each new session — a deliberate
-       trade for not having a token-shaped secret sitting in local storage.
+     - UPDATED: both Google and Microsoft now persist across sessions —
+       Google via a refresh token stored in STATE (see the Google Account
+       section below for the full reasoning and trade-off), Microsoft via
+       MSAL's own localStorage cache. Neither requires re-signing-in on
+       every visit anymore. This is a deliberate trade of "nothing
+       token-shaped ever touches storage" for "cross-device sync doesn't
+       require re-authenticating constantly" — appropriate for a personal
+       device, not recommended if this app is ever used on a shared machine.
      - Events are fetched live, every time the Calendar view renders —
        nothing about a Google/Outlook event is ever cached locally. This
        means there is no local-vs-remote sync state that can ever drift;
@@ -3151,7 +3160,7 @@ function startNewSeason(name, durationMonths){
        for anyone not using this feature, and still opens instantly offline.
    ========================================================================== */
 const CALSYNC = {
-  google: { tokenClient: null, accessToken: null, expiresAt: 0, gisLoaded: false },
+  google: { accessToken: null, expiresAt: 0 },
   microsoft: { msalInstance: null, account: null, msalLoaded: false },
 };
 
@@ -3167,45 +3176,94 @@ function loadScriptOnce(src){
   });
 }
 
-/* ---- Google Calendar ---- */
+/* ---- Google Account (Calendar + Drive Sync) ----
+   Authorization Code + PKCE, with a persisted refresh token — a deliberate
+   change from the original "never persist tokens, reconnect every session"
+   design. That trade-off was too much friction for a feature (cross-device
+   sync) whose whole point is not having to think about it. The refresh
+   token lives in STATE (so: in localStorage, on this device) — accepted
+   risk for a personal device, not recommended if this app is ever used on
+   a shared/public machine. The token EXCHANGE itself still has to happen
+   server-side (see worker.js) since Google requires a client_secret for
+   this even with PKCE — that secret never reaches the browser.
+*/
+function base64UrlEncode(bytes){
+  let str = "";
+  bytes.forEach(b => { str += String.fromCharCode(b); });
+  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+async function generatePkcePair(){
+  const verifierBytes = new Uint8Array(32);
+  crypto.getRandomValues(verifierBytes);
+  const codeVerifier = base64UrlEncode(verifierBytes);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(codeVerifier));
+  const codeChallenge = base64UrlEncode(new Uint8Array(digest));
+  return { codeVerifier, codeChallenge };
+}
+function googleRedirectUri(){
+  return window.location.origin + window.location.pathname;
+}
 async function connectGoogleCalendar(){
   const clientId = STATE.integrations.google.clientId.trim();
   if(!clientId){ showToast("Add a Google Client ID in Settings first"); return; }
-  try{
-    await loadScriptOnce(CONFIG.GOOGLE_GIS_SRC);
-  }catch(err){
-    showToast("Couldn't load Google's sign-in library — are you online?");
-    return;
-  }
-  if(!window.google || !window.google.accounts){
-    showToast("Google sign-in library didn't initialize — try again");
-    return;
-  }
-  CALSYNC.google.tokenClient = google.accounts.oauth2.initTokenClient({
+  const { codeVerifier, codeChallenge } = await generatePkcePair();
+  sessionStorage.setItem("founderos.google.pkceVerifier", codeVerifier);
+  const params = new URLSearchParams({
     client_id: clientId,
+    redirect_uri: googleRedirectUri(),
+    response_type: "code",
     scope: CONFIG.GOOGLE_SCOPE,
-    callback: async (resp) => {
-      if(resp.error){ showToast(`Google sign-in failed: ${resp.error}`); return; }
-      CALSYNC.google.accessToken = resp.access_token;
-      CALSYNC.google.expiresAt = Date.now() + (Number(resp.expires_in) || 3500) * 1000;
-      try{
-        const info = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
-          headers: { Authorization: `Bearer ${resp.access_token}` },
-        }).then(r => r.json());
-        STATE.integrations.google.connected = true;
-        STATE.integrations.google.accountEmail = info.email || "";
-        saveState();
-        showToast(`Connected Google Calendar (${info.email || "unknown account"})`);
-      }catch(e){
-        STATE.integrations.google.connected = true; // token is valid even if the email lookup failed
-        saveState();
-        showToast("Connected Google Calendar");
-      }
-      renderApp();
-      await handlePostConnectSync();
-    },
+    access_type: "offline",   // required to get a refresh token back
+    prompt: "consent",         // required for Google to reliably re-issue a refresh token, not just an access token
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
   });
-  CALSYNC.google.tokenClient.requestAccessToken({ prompt: "consent" });
+  window.location.href = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+}
+// Runs once on every app load — checks whether the URL contains a Google
+// auth redirect (?code=...) and, if so, completes the exchange. This is the
+// "callback" now that sign-in is a full-page redirect instead of a popup.
+async function handleGoogleRedirectIfPresent(){
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get("code");
+  if(!code) return;
+  // Clean the URL immediately regardless of outcome — don't leave a code
+  // sitting in the address bar (it's single-use and short-lived, but still).
+  window.history.replaceState({}, "", window.location.pathname);
+
+  const codeVerifier = sessionStorage.getItem("founderos.google.pkceVerifier");
+  sessionStorage.removeItem("founderos.google.pkceVerifier");
+  if(!codeVerifier){ showToast("Google sign-in couldn't complete — try connecting again"); return; }
+
+  try{
+    const resp = await fetch("/api/google/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code, codeVerifier,
+        redirectUri: googleRedirectUri(),
+        clientId: STATE.integrations.google.clientId.trim(),
+      }),
+    });
+    const data = await resp.json();
+    if(!resp.ok || data.error) throw new Error(data.error_description || data.error || `Token exchange failed (${resp.status})`);
+
+    CALSYNC.google.accessToken = data.access_token;
+    CALSYNC.google.expiresAt = Date.now() + (Number(data.expires_in) || 3500) * 1000;
+    if(data.refresh_token) STATE.integrations.google.refreshToken = data.refresh_token; // Google only sends this on first consent — don't overwrite with nothing on later re-auths
+
+    const info = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+      headers: { Authorization: `Bearer ${data.access_token}` },
+    }).then(r => r.json()).catch(() => ({}));
+    STATE.integrations.google.connected = true;
+    STATE.integrations.google.accountEmail = info.email || STATE.integrations.google.accountEmail || "";
+    saveState();
+    showToast(`Connected Google (${STATE.integrations.google.accountEmail || "unknown account"})`);
+    await handlePostConnectSync();
+  }catch(err){
+    showToast(`Google sign-in failed: ${err.message || err}`);
+  }
+  renderApp();
 }
 // Shared by both entry points (Settings > Connect, and the Welcome screen's
 // "Restore your console" path). On a genuinely fresh device (onboarding not
@@ -3231,32 +3289,40 @@ async function handlePostConnectSync(){
   }
 }
 function disconnectGoogleCalendar(){
-  if(CALSYNC.google.accessToken && window.google){
-    google.accounts.oauth2.revoke(CALSYNC.google.accessToken, () => {});
+  // GIS's JS library isn't loaded anywhere anymore (the redirect flow above
+  // doesn't need it) — revoke via Google's plain REST endpoint instead of
+  // depending on a script that may not be present.
+  const tokenToRevoke = STATE.integrations.google.refreshToken || CALSYNC.google.accessToken;
+  if(tokenToRevoke){
+    fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(tokenToRevoke)}`, { method: "POST" }).catch(() => {});
   }
   CALSYNC.google.accessToken = null;
   CALSYNC.google.expiresAt = 0;
   STATE.integrations.google.connected = false;
   STATE.integrations.google.accountEmail = "";
+  STATE.integrations.google.refreshToken = null;
   saveState();
   renderApp();
 }
-// Silent refresh when possible; otherwise re-prompts (Google's token client
-// doesn't guarantee a fully silent renewal for every browser/consent state).
+// No more popups for routine use — if there's a valid cached access token,
+// use it; otherwise use the persisted refresh token to silently mint a new
+// one via the Worker. Only throws if this device was truly never connected.
 async function getGoogleAccessToken(){
   if(CALSYNC.google.accessToken && Date.now() < CALSYNC.google.expiresAt - 30000){
     return CALSYNC.google.accessToken;
   }
-  if(!CALSYNC.google.tokenClient) throw new Error("Google Calendar isn't connected");
-  return new Promise((resolve, reject) => {
-    CALSYNC.google.tokenClient.callback = (resp) => {
-      if(resp.error){ reject(new Error(resp.error)); return; }
-      CALSYNC.google.accessToken = resp.access_token;
-      CALSYNC.google.expiresAt = Date.now() + (Number(resp.expires_in) || 3500) * 1000;
-      resolve(resp.access_token);
-    };
-    CALSYNC.google.tokenClient.requestAccessToken({ prompt: "" });
+  const refreshToken = STATE.integrations.google.refreshToken;
+  if(!refreshToken) throw new Error("Google account isn't connected");
+  const resp = await fetch("/api/google/refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refreshToken, clientId: STATE.integrations.google.clientId.trim() }),
   });
+  const data = await resp.json();
+  if(!resp.ok || data.error) throw new Error(data.error_description || data.error || `Token refresh failed (${resp.status})`);
+  CALSYNC.google.accessToken = data.access_token;
+  CALSYNC.google.expiresAt = Date.now() + (Number(data.expires_in) || 3500) * 1000;
+  return data.access_token;
 }
 async function listGoogleEvents(timeMinISO, timeMaxISO){
   const token = await getGoogleAccessToken();
@@ -3324,7 +3390,7 @@ async function connectMicrosoftCalendar(){
       authority: `https://login.microsoftonline.com/${tenantId}`,
       redirectUri: window.location.origin + window.location.pathname,
     },
-    cache: { cacheLocation: "sessionStorage" }, // session-only, matches the "don't persist tokens" rule above
+    cache: { cacheLocation: "localStorage" }, // persists across sessions — MSAL handles silent token refresh internally using this, no custom refresh-token plumbing needed like Google requires below
   });
   try{
     await CALSYNC.microsoft.msalInstance.initialize();
@@ -3349,7 +3415,33 @@ function disconnectMicrosoftCalendar(){
   saveState();
   renderApp();
 }
+// On a fresh page load, CALSYNC.microsoft.account is empty even though MSAL's
+// own localStorage cache (see cacheLocation above) still has the account —
+// this rebuilds the in-memory reference from that persisted cache instead of
+// requiring a fresh sign-in every time.
+async function restoreMicrosoftSession(){
+  if(!STATE.integrations.microsoft.connected || CALSYNC.microsoft.account) return;
+  try{
+    await loadScriptOnce(CONFIG.MSAL_SRC);
+    if(!window.msal) return;
+    const tenantId = STATE.integrations.microsoft.tenantId.trim() || "common";
+    CALSYNC.microsoft.msalInstance = new msal.PublicClientApplication({
+      auth: {
+        clientId: STATE.integrations.microsoft.clientId.trim(),
+        authority: `https://login.microsoftonline.com/${tenantId}`,
+        redirectUri: window.location.origin + window.location.pathname,
+      },
+      cache: { cacheLocation: "localStorage" },
+    });
+    await CALSYNC.microsoft.msalInstance.initialize();
+    const accounts = CALSYNC.microsoft.msalInstance.getAllAccounts();
+    if(accounts.length > 0) CALSYNC.microsoft.account = accounts[0];
+  }catch(err){
+    console.warn("Founder OS: couldn't restore Microsoft session", err);
+  }
+}
 async function getMicrosoftAccessToken(){
+  if(!CALSYNC.microsoft.msalInstance || !CALSYNC.microsoft.account) await restoreMicrosoftSession();
   if(!CALSYNC.microsoft.msalInstance || !CALSYNC.microsoft.account) throw new Error("Microsoft Calendar isn't connected");
   try{
     const result = await CALSYNC.microsoft.msalInstance.acquireTokenSilent({ scopes: CONFIG.MS_SCOPES, account: CALSYNC.microsoft.account });
@@ -3655,13 +3747,10 @@ async function syncWithDrive(opts){
     if(!silent) showToast("Connect Google in Settings first");
     return;
   }
-  // The "Connected" flag is remembered from a previous session, but the
-  // live token grant is intentionally never persisted (see the top-of-file
-  // note on CALSYNC) — it resets on every page reload. If this session
-  // never actually connected yet, silently reconnect first instead of
-  // failing with a confusing "isn't connected" error; connectGoogleCalendar
-  // already re-runs the sync itself once the fresh sign-in completes.
-  if(!CALSYNC.google.tokenClient){
+  if(!STATE.integrations.google.refreshToken){
+    // Connected flag is true but no refresh token (e.g. upgraded from the
+    // old session-only auth and never reconnected since) — nothing to
+    // silently renew with, needs one real sign-in to get a refresh token.
     if(!silent) showToast("Reconnecting to Google…");
     connectGoogleCalendar();
     return;
@@ -5992,7 +6081,7 @@ function renderSettings(){
                   : STATE.integrations.driveSync.lastSyncedAt
                     ? `Last synced ${escapeHtml(timeAgo(STATE.integrations.driveSync.lastSyncedAt))}.`
                     : "Connected — not synced yet on this device."}
-                ${STATE.integrations.google.connected ? " Since access isn't kept between sessions for security, click Sync Now once per session (or right after reconnecting) — it won't run silently in the background." : ""}
+                ${STATE.integrations.google.connected ? " Stays signed in on this device — auto-syncs a few seconds after any change, no need to reconnect each visit." : ""}
               </div>
             </div>
             <button class="btn btn-primary btn-sm" data-action="sync-drive-now" ${!STATE.integrations.google.connected ? "disabled" : ""}>${icon("refresh")} Sync now</button>
@@ -7983,6 +8072,11 @@ function initApp(){
     preloadCoreFonts().then(() => {
       renderApp();
       bindGlobalKeyboardShortcuts();
+      // Handles the Google redirect-back (?code=...) if present, and quietly
+      // restores the Microsoft session from MSAL's own persisted cache.
+      // Both are safe no-ops when there's nothing to restore.
+      handleGoogleRedirectIfPresent();
+      restoreMicrosoftSession();
     }).catch(renderFatalError);
   }catch(err){
     renderFatalError(err);

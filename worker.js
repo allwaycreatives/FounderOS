@@ -29,11 +29,76 @@ export default {
     if (url.pathname.startsWith("/api/notion/")) {
       return handleNotionProxy(request, env, url);
     }
+    if (url.pathname === "/api/google/token" || url.pathname === "/api/google/refresh") {
+      return handleGoogleTokenExchange(request, env, url);
+    }
 
     // Anything else: behave exactly like the old assets-only deployment.
     return env.ASSETS.fetch(request);
   },
 };
+
+/**
+ * Google OAuth token exchange — the one step that MUST happen server-side.
+ * Google's token endpoint requires a client_secret for Web-application-type
+ * OAuth clients even when using PKCE, which is exactly why this can't be
+ * done from the browser (a secret shipped to the browser isn't a secret).
+ * GOOGLE_CLIENT_SECRET is a Worker secret (Settings > Variables and Secrets
+ * on the founderos Worker) — never committed to this repo, never sent to
+ * the browser. The client_id itself isn't secret, so it's just passed
+ * through from the request body.
+ */
+async function handleGoogleTokenExchange(request, env, url) {
+  if (!env.GOOGLE_CLIENT_SECRET) {
+    return json(
+      { error: "GOOGLE_CLIENT_SECRET is not configured on this Worker. Set it in Cloudflare dashboard > Settings > Variables and Secrets." },
+      500
+    );
+  }
+  if (request.method !== "POST") return json({ error: "POST only" }, 405);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const params = new URLSearchParams();
+  params.set("client_id", body.clientId || "");
+  params.set("client_secret", env.GOOGLE_CLIENT_SECRET);
+
+  if (url.pathname === "/api/google/token") {
+    if (!body.code || !body.codeVerifier || !body.redirectUri) {
+      return json({ error: "Missing code, codeVerifier, or redirectUri" }, 400);
+    }
+    params.set("code", body.code);
+    params.set("code_verifier", body.codeVerifier);
+    params.set("redirect_uri", body.redirectUri);
+    params.set("grant_type", "authorization_code");
+  } else {
+    if (!body.refreshToken) return json({ error: "Missing refreshToken" }, 400);
+    params.set("refresh_token", body.refreshToken);
+    params.set("grant_type", "refresh_token");
+  }
+
+  let tokenResp;
+  try {
+    tokenResp = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString(),
+    });
+  } catch (err) {
+    return json({ error: `Couldn't reach Google: ${err.message || err}` }, 502);
+  }
+
+  const responseBody = await tokenResp.text();
+  return new Response(responseBody, {
+    status: tokenResp.status,
+    headers: { "content-type": "application/json" },
+  });
+}
 
 async function handleNotionProxy(request, env, url) {
   if (!env.NOTION_TOKEN) {
