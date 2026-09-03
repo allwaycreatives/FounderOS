@@ -32,11 +32,66 @@ export default {
     if (url.pathname === "/api/google/token" || url.pathname === "/api/google/refresh") {
       return handleGoogleTokenExchange(request, env, url);
     }
+    if (url.pathname === "/api/claude/chat") {
+      return handleClaudeChat(request, env);
+    }
 
     // Anything else: behave exactly like the old assets-only deployment.
     return env.ASSETS.fetch(request);
   },
 };
+
+/**
+ * In-app Claude assistant. Same reasoning as the Notion/Google proxies —
+ * ANTHROPIC_API_KEY is a Worker secret, never sent to the browser. This is
+ * the founder's OWN Anthropic Console account and billing, separate from
+ * (and unrelated to) whatever Claude product built this app.
+ */
+async function handleClaudeChat(request, env) {
+  if (!env.ANTHROPIC_API_KEY) {
+    return json(
+      { error: "ANTHROPIC_API_KEY is not configured on this Worker. Set it in Cloudflare dashboard > Settings > Variables and Secrets." },
+      500
+    );
+  }
+  if (request.method !== "POST") return json({ error: "POST only" }, 405);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return json({ error: "messages array is required" }, 400);
+  }
+
+  let anthropicResp;
+  try {
+    anthropicResp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-5",
+        max_tokens: 1500,
+        system: body.system || undefined,
+        messages: body.messages,
+      }),
+    });
+  } catch (err) {
+    return json({ error: `Couldn't reach Anthropic: ${err.message || err}` }, 502);
+  }
+
+  const responseBody = await anthropicResp.text();
+  return new Response(responseBody, {
+    status: anthropicResp.status,
+    headers: { "content-type": "application/json" },
+  });
+}
 
 /**
  * Google OAuth token exchange — the one step that MUST happen server-side.

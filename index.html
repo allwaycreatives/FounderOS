@@ -1227,6 +1227,23 @@ kbd{
   .cal-cell{ min-height:56px; }
   .cal-chip{ font-size:10px; }
 }
+
+/* Assistant */
+.assistant-panel{ display:flex; flex-direction:column; height:min(640px, 70vh); padding:0; overflow:hidden; }
+.assistant-messages{ flex:1; overflow-y:auto; padding:var(--space-5); display:flex; flex-direction:column; gap:var(--space-4); }
+.assistant-empty{ margin:auto; max-width:420px; }
+.assistant-bubble{ max-width:78%; padding:10px 14px; border-radius:14px; line-height:1.5; font-size:13.5px; }
+.assistant-bubble-label{ font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-tertiary); margin-bottom:3px; }
+.assistant-bubble-user{ align-self:flex-end; background:var(--amber-dim); border:1px solid var(--amber-line); border-bottom-right-radius:4px; }
+.assistant-bubble-assistant{ align-self:flex-start; background:rgba(255,255,255,0.05); border:1px solid var(--panel-border); border-bottom-left-radius:4px; white-space:pre-wrap; }
+.assistant-typing .assistant-bubble-text{ opacity:0.5; }
+.assistant-input-row{ display:flex; gap:var(--space-3); align-items:flex-end; padding:var(--space-4); border-top:1px solid var(--panel-border); }
+.assistant-input{ flex:1; min-height:44px; max-height:140px; resize:vertical; }
+.assistant-input-row .btn{ flex-shrink:0; }
+@media (max-width:640px){
+  .assistant-bubble{ max-width:90%; }
+  .assistant-panel{ height:min(560px, 65vh); }
+}
 </style>
 </head>
 <body>
@@ -1295,6 +1312,7 @@ const AW_BRANDMARK_ICON_DATA_URI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg
 
 const NAV_ITEMS = [
   { id: "dashboard",     label: "Dashboard",     icon: "grid",     built: true  },
+  { id: "assistant",     label: "Assistant",     icon: "assistant",built: true  },
   { id: "portfolio",     label: "Portfolio",     icon: "layers",   built: true  },
   { id: "projects",      label: "Projects",      icon: "folder",   built: true  },
   { id: "missions",      label: "Missions",      icon: "target",   built: true  },
@@ -1332,6 +1350,9 @@ const TOUR_CONTENT = {
     { title: "Today's Top 3 Missions", blurb: "The three highest-impact moves across your whole portfolio, ranked by impact score — not a full to-do list, just what's worth doing first.", target: "top-missions" },
     { title: "Momentum, Recovery & Agency Health", blurb: "A running pulse on how consistently you're working, how rested you are, and how each business is doing — so burnout or a stalling business shows up before it becomes a crisis.", target: ["momentum", "recovery-card", "agency-health"] },
     { title: "Recent Activity", blurb: "A quick log of what actually got done recently, across every business — useful for a fast \"what did I do this week\" check.", target: "activity" },
+  ],
+  assistant: [
+    { title: "Assistant", blurb: "Ask it anything about how you're running things — it can see your current missions, projects, and priorities, so answers are grounded in your real data, not generic advice." },
   ],
   portfolio: [
     { title: "Portfolio", blurb: "Every business you're running, each with its own health status at a glance. Click into one to drill down into its projects and missions." },
@@ -1428,6 +1449,7 @@ const ICONS = {
   content: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="14" rx="2"/><path d="m9 8 6 3-6 3V8Z" fill="currentColor" stroke="none"/><path d="M3 21h18"/></svg>',
   extcal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/><path d="M8 13h2M8 17h2M14 13h2M14 17h2"/></svg>',
   refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 4v5h-5"/></svg>',
+  assistant: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3a7 7 0 0 0-7 7c0 2.4 1.15 4.53 2.93 5.87L7 21l3.5-1.8c.48.13.99.2 1.5.2a7 7 0 0 0 0-14Z"/><circle cx="9" cy="10" r="0.9" fill="currentColor" stroke="none"/><circle cx="12" cy="10" r="0.9" fill="currentColor" stroke="none"/><circle cx="15" cy="10" r="0.9" fill="currentColor" stroke="none"/></svg>',
 };
 
 function icon(name){ return ICONS[name] || ""; }
@@ -3808,6 +3830,150 @@ async function syncWithDrive(opts){
 }
 
 /* ==========================================================================
+   SECTION: IN-APP ASSISTANT (Claude)
+   Same proxy pattern as Notion/Google — ANTHROPIC_API_KEY is a Worker
+   secret (see worker.js), never sent to the browser. This is the founder's
+   own Anthropic Console account and billing, entirely separate from
+   whatever built this app in the first place.
+
+   Grounded, not blind: every message sends a fresh system-prompt summary
+   of real current data (top missions, active projects, upcoming content,
+   contacts overdue for follow-up) built at send-time from STATE — so "what
+   should I focus on" gets a real answer, not generic advice. Rebuilt fresh
+   each send rather than cached, same reasoning as Calendar/Notion: it
+   should never be looking at stale data.
+
+   Deliberately scoped out of this pass: chat history is in-memory only,
+   not persisted to STATE or synced to Drive. Simple to add later
+   (ASSISTANT_MESSAGES -> a STATE array with the same updatedAt pattern
+   everything else uses) if worth the complexity; not obviously worth it
+   for what's mostly ad-hoc "help me think through this" conversations.
+   ========================================================================== */
+let ASSISTANT_MESSAGES = []; // {role: "user"|"assistant", content: string}
+let assistantSending = false;
+
+function buildAssistantContext(){
+  const lines = [];
+  lines.push(`You are the in-app assistant inside Founder OS, a personal operating system for running one or more businesses. Be direct, concise, and genuinely useful — this is a real founder running a real business, not a demo.`);
+  if(STATE.founder && STATE.founder.name){
+    lines.push(`Founder: ${STATE.founder.name}. Current season goal: ${STATE.season ? STATE.season.name : "not set"}.`);
+  }
+  const activeMissions = STATE.missions
+    .filter(m => m.status === "active")
+    .sort((a, b) => b.impactScore - a.impactScore)
+    .slice(0, 8);
+  if(activeMissions.length){
+    lines.push(`Active missions (highest impact first):`);
+    activeMissions.forEach(m => {
+      const proj = m.projectId ? projectById(m.projectId) : null;
+      lines.push(`- "${m.title}" (impact ${m.impactScore}/10, ${m.progress}% done${proj ? `, project: ${proj.name}` : ""})`);
+    });
+  }
+  const activeProjects = STATE.projects.filter(p => p.status === "active").slice(0, 10);
+  if(activeProjects.length){
+    lines.push(`Active projects: ${activeProjects.map(p => p.name).join(", ")}.`);
+  }
+  const now = Date.now();
+  const upcomingContent = STATE.contentItems
+    .filter(c => c.stage !== "published" && (c.dueDate || c.publishDate))
+    .sort((a, b) => (a.dueDate || a.publishDate) - (b.dueDate || b.publishDate))
+    .slice(0, 5);
+  if(upcomingContent.length){
+    lines.push(`Upcoming content:`);
+    upcomingContent.forEach(c => {
+      const d = c.dueDate || c.publishDate;
+      lines.push(`- "${c.title}" (${c.platform}, ${c.stage}, ${new Date(d).toLocaleDateString()})`);
+    });
+  }
+  const overdueContacts = STATE.contacts.filter(c => c.nextFollowUpAt && c.nextFollowUpAt < now).slice(0, 5);
+  if(overdueContacts.length){
+    lines.push(`Contacts overdue for follow-up: ${overdueContacts.map(c => c.name).join(", ")}.`);
+  }
+  return lines.join("\n");
+}
+
+async function sendAssistantMessage(text){
+  if(!text.trim() || assistantSending) return;
+  ASSISTANT_MESSAGES.push({ role: "user", content: text.trim() });
+  assistantSending = true;
+  renderApp();
+  try{
+    const res = await fetch("/api/claude/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        system: buildAssistantContext(),
+        messages: ASSISTANT_MESSAGES.map(m => ({ role: m.role, content: m.content })),
+      }),
+    });
+    const data = await res.json();
+    if(!res.ok || data.error) throw new Error((data.error && (data.error.message || data.error)) || `Assistant request failed (${res.status})`);
+    const replyText = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
+    ASSISTANT_MESSAGES.push({ role: "assistant", content: replyText || "(no response)" });
+  }catch(err){
+    ASSISTANT_MESSAGES.push({ role: "assistant", content: `Something went wrong: ${err.message || err}` });
+  }
+  assistantSending = false;
+  renderApp();
+}
+
+function renderAssistant(){
+  const bubbles = ASSISTANT_MESSAGES.map(m => `
+    <div class="assistant-bubble assistant-bubble-${m.role}">
+      <div class="assistant-bubble-label">${m.role === "user" ? "You" : "Assistant"}</div>
+      <div class="assistant-bubble-text">${escapeHtml(m.content)}</div>
+    </div>`).join("");
+
+  return `
+  <div class="view-enter assistant-shell">
+    <div class="toolbar">
+      <div class="toolbar-filters">
+        <span class="tag tag-neutral">Sees your active missions, projects, upcoming content, and overdue follow-ups</span>
+      </div>
+      <button class="btn btn-ghost btn-sm" data-action="clear-assistant-chat" ${ASSISTANT_MESSAGES.length === 0 ? "disabled" : ""}>${icon("trash")} Clear chat</button>
+    </div>
+    <div class="card glass col-12 assistant-panel">
+      <div class="assistant-messages" id="assistantMessages">
+        ${bubbles || `<div class="assistant-empty">${emptyState("assistant", "Ask for anything", "\"What should I focus on today?\", \"draft a follow-up to a client\", \"help me think through this decision\" — it can see your real missions, projects, and priorities.")}</div>`}
+        ${assistantSending ? `<div class="assistant-bubble assistant-bubble-assistant assistant-typing"><div class="assistant-bubble-label">Assistant</div><div class="assistant-bubble-text">…</div></div>` : ""}
+      </div>
+      <form id="assistantForm" class="assistant-input-row">
+        <textarea class="field-textarea assistant-input" id="assistantInput" placeholder="Ask for help with anything…" rows="2" ${assistantSending ? "disabled" : ""}></textarea>
+        <button type="submit" class="btn btn-primary" ${assistantSending ? "disabled" : ""}>${icon("send")}</button>
+      </form>
+    </div>
+  </div>`;
+}
+
+function bindAssistantEvents(){
+  const form = document.getElementById("assistantForm");
+  const input = document.getElementById("assistantInput");
+  if(form && input){
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const text = input.value;
+      input.value = "";
+      sendAssistantMessage(text);
+    });
+    input.addEventListener("keydown", (e) => {
+      if(e.key === "Enter" && !e.shiftKey){
+        e.preventDefault();
+        form.requestSubmit();
+      }
+    });
+  }
+  const clearBtn = document.querySelector('[data-action="clear-assistant-chat"]');
+  if(clearBtn){
+    clearBtn.addEventListener("click", () => {
+      ASSISTANT_MESSAGES = [];
+      renderApp();
+    });
+  }
+  const messagesEl = document.getElementById("assistantMessages");
+  if(messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+/* ==========================================================================
    SECTION: MODAL SYSTEM
    A single reusable modal mount point. Callers supply inner HTML and an
    onMount callback to wire up form submission — this keeps every
@@ -6181,6 +6347,7 @@ function renderSettings(){
 
 const VIEW_RENDERERS = {
   dashboard: renderDashboard,
+  assistant: renderAssistant,
   portfolio: renderPortfolio,
   projects: renderProjects,
   missions: renderMissions,
@@ -6648,6 +6815,7 @@ function currentViewTitle(){
 function currentViewDesc(){
   const descs = {
     dashboard: "What should I build today?",
+    assistant: "Ask for help — it can see your real data.",
     portfolio: "Every business you're running, in one place.",
     projects: "The work in flight across the whole portfolio.",
     missions: "The highest-leverage moves, broken into tasks.",
@@ -6965,6 +7133,7 @@ function bindEvents(){
   bindTemplateEvents();
   bindContentEvents();
   bindCalendarSyncEvents();
+  bindAssistantEvents();
   bindMissionEvents();
   bindRecoveryEvents();
   bindOpportunityEvents();
