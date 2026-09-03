@@ -1264,6 +1264,11 @@ const CONFIG = {
   GOOGLE_GIS_SRC: "https://accounts.google.com/gsi/client", // no longer used — Google Calendar/Drive sign-in moved to a plain redirect (Authorization Code + PKCE) so a refresh token could be persisted; left here only in case GIS is needed again for something else later
   MSAL_SRC: "https://alcdn.msauth.net/browser/3.7.1/js/msal-browser.min.js", // verify latest at https://www.npmjs.com/package/@azure/msal-browser before relying on this pin
   GOOGLE_SCOPE: "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive.appdata",
+  // Not a secret — OAuth Client IDs for browser-based apps are meant to be
+  // public (visible in every request the browser makes anyway). Baked in
+  // here so nobody using this app ever has to find or paste it in — that's
+  // developer setup, not something a user of the app should ever see.
+  GOOGLE_CLIENT_ID: "229015857681-um7m9gpr18ngqu2om9r4db94m0vmrcvk.apps.googleusercontent.com",
   MS_SCOPES: ["Calendars.ReadWrite", "User.Read"],
 };
 
@@ -3208,12 +3213,10 @@ function googleRedirectUri(){
   return (window.location.origin + window.location.pathname).replace(/\/$/, "");
 }
 async function connectGoogleCalendar(){
-  const clientId = STATE.integrations.google.clientId.trim();
-  if(!clientId){ showToast("Add a Google Client ID in Settings first"); return; }
   const { codeVerifier, codeChallenge } = await generatePkcePair();
   sessionStorage.setItem("founderos.google.pkceVerifier", codeVerifier);
   const params = new URLSearchParams({
-    client_id: clientId,
+    client_id: CONFIG.GOOGLE_CLIENT_ID,
     redirect_uri: googleRedirectUri(),
     response_type: "code",
     scope: CONFIG.GOOGLE_SCOPE,
@@ -3246,7 +3249,7 @@ async function handleGoogleRedirectIfPresent(){
       body: JSON.stringify({
         code, codeVerifier,
         redirectUri: googleRedirectUri(),
-        clientId: STATE.integrations.google.clientId.trim(),
+        clientId: CONFIG.GOOGLE_CLIENT_ID,
       }),
     });
     const data = await resp.json();
@@ -3320,7 +3323,7 @@ async function getGoogleAccessToken(){
   const resp = await fetch("/api/google/refresh", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refreshToken, clientId: STATE.integrations.google.clientId.trim() }),
+    body: JSON.stringify({ refreshToken, clientId: CONFIG.GOOGLE_CLIENT_ID }),
   });
   const data = await resp.json();
   if(!resp.ok || data.error) throw new Error(data.error_description || data.error || `Token refresh failed (${resp.status})`);
@@ -6103,7 +6106,6 @@ function renderSettings(){
             <div style="flex:1;">
               <div class="settings-row-label">Google Calendar</div>
               <div class="settings-row-desc" style="margin-bottom:8px;">${STATE.integrations.google.connected ? `Connected — ${escapeHtml(STATE.integrations.google.accountEmail || "")}` : "Not connected."} ${STATE.integrations.google.connected ? "This same connection also powers Data Sync below." : ""}</div>
-              ${!STATE.integrations.google.connected ? `<input class="field-input" id="googleClientIdInput" placeholder="Google OAuth Client ID" value="${escapeHtml(STATE.integrations.google.clientId)}" style="margin-bottom:8px;max-width:420px;" />` : ""}
             </div>
             <button class="btn ${STATE.integrations.google.connected ? "btn-ghost" : "btn-primary"} btn-sm" data-action="${STATE.integrations.google.connected ? "disconnect-google" : "connect-google"}">${STATE.integrations.google.connected ? "Disconnect" : "Connect"}</button>
           </div>
@@ -6391,41 +6393,6 @@ function completeOnboardingWithWizard(){
   showToast(`Welcome, ${founder.name} — your console is ready`);
 }
 
-function openRestoreSyncModal(){
-  const savedClientId = STATE.integrations.google.clientId;
-  openModal(`
-    <div class="modal-header">
-      <div class="modal-title">Restore your console</div>
-      <button class="modal-close" data-modal-close>${icon("close")}</button>
-    </div>
-    <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);line-height:1.6;">
-      If you've already set up Founder OS on another device and turned on Data Sync there, signing into the same Google account here will pull your real console down instead of starting over.
-    </div>
-    <form id="restoreSyncForm">
-      ${!savedClientId ? `
-      <div class="field">
-        <label class="field-label">Google OAuth Client ID</label>
-        <input class="field-input" id="restoreClientIdInput" placeholder="Same Client ID used on your other device" required />
-        <div style="font-size:12px;color:var(--text-tertiary);margin-top:4px;">One-time setup step — this isn't a password, just an app identifier. Find it in Settings > Data Sync on your other device, or your Google Cloud Console.</div>
-      </div>` : ""}
-      <div class="modal-footer">
-        <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
-        <button type="submit" class="btn btn-primary">${icon("refresh")} Connect &amp; Restore</button>
-      </div>
-    </form>
-  `, (root) => {
-    root.querySelector("#restoreSyncForm").addEventListener("submit", (e) => {
-      e.preventDefault();
-      const clientIdInput = root.querySelector("#restoreClientIdInput");
-      if(clientIdInput) STATE.integrations.google.clientId = clientIdInput.value.trim();
-      if(!STATE.integrations.google.clientId){ showToast("Enter the Client ID first"); return; }
-      saveState();
-      closeModal();
-      connectGoogleCalendar();
-    });
-  });
-}
-
 function bindOnboardingEvents(){
   const startWizardBtn = document.querySelector('[data-action="onboarding-start-wizard"]');
   if(startWizardBtn) startWizardBtn.addEventListener("click", () => {
@@ -6437,7 +6404,7 @@ function bindOnboardingEvents(){
   if(startDemoBtn) startDemoBtn.addEventListener("click", completeOnboardingWithDemo);
 
   const restoreSyncBtn = document.querySelector('[data-action="onboarding-restore-sync"]');
-  if(restoreSyncBtn) restoreSyncBtn.addEventListener("click", openRestoreSyncModal);
+  if(restoreSyncBtn) restoreSyncBtn.addEventListener("click", connectGoogleCalendar);
 
   const backWelcome = document.querySelector('[data-action="onboarding-back-welcome"]');
   if(backWelcome) backWelcome.addEventListener("click", () => { STATE.ui.onboardingStep = "welcome"; saveState(); renderApp(); });
@@ -6904,16 +6871,10 @@ function bindEvents(){
     });
   }
 
-  // Calendar Sync connect/disconnect — the Client ID / Tenant ID inputs
-  // save on change so a half-typed ID isn't lost if the person clicks
-  // Connect before finishing, and so the same value is remembered next visit.
-  const googleClientIdInput = document.getElementById("googleClientIdInput");
-  if(googleClientIdInput){
-    googleClientIdInput.addEventListener("change", () => {
-      STATE.integrations.google.clientId = googleClientIdInput.value.trim();
-      saveState();
-    });
-  }
+  // Calendar Sync connect/disconnect — Microsoft's Client ID / Tenant ID
+  // still need collecting per Azure app registration; Google's no longer
+  // does, it's a hardcoded CONFIG constant now (not a secret, safe to bake
+  // in — see CONFIG.GOOGLE_CLIENT_ID).
   const msClientIdInput = document.getElementById("msClientIdInput");
   if(msClientIdInput){
     msClientIdInput.addEventListener("change", () => {
@@ -6930,11 +6891,7 @@ function bindEvents(){
   }
   const connectGoogleBtn = document.querySelector('[data-action="connect-google"]');
   if(connectGoogleBtn){
-    connectGoogleBtn.addEventListener("click", () => {
-      if(googleClientIdInput) STATE.integrations.google.clientId = googleClientIdInput.value.trim();
-      saveState();
-      connectGoogleCalendar();
-    });
+    connectGoogleBtn.addEventListener("click", connectGoogleCalendar);
   }
   const disconnectGoogleBtn = document.querySelector('[data-action="disconnect-google"]');
   if(disconnectGoogleBtn) disconnectGoogleBtn.addEventListener("click", disconnectGoogleCalendar);
