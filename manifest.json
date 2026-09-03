@@ -1,0 +1,8 @@
+{
+  "name": "Founder OS",
+  "short_name": "Founder OS",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#121212",
+  "theme_color": "#121212"
+}
