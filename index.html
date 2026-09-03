@@ -3201,7 +3201,11 @@ async function generatePkcePair(){
   return { codeVerifier, codeChallenge };
 }
 function googleRedirectUri(){
-  return window.location.origin + window.location.pathname;
+  // Must match EXACTLY what's registered in Google Cloud Console (no
+  // trailing slash) — window.location.pathname on the root URL is "/",
+  // which without this strip would silently produce a trailing-slash
+  // mismatch and a redirect_uri_mismatch error.
+  return (window.location.origin + window.location.pathname).replace(/\/$/, "");
 }
 async function connectGoogleCalendar(){
   const clientId = STATE.integrations.google.clientId.trim();
