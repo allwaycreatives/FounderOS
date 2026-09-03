@@ -1248,7 +1248,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 17,
+  SCHEMA_VERSION: 18,
   APP_NAME: "Founder OS",
   APP_SUB: "Command Center",
   CURRENT_VERSION_LABEL: "v0.3 · Relationships & Notes",
@@ -1692,6 +1692,7 @@ function FounderProfileModel(overrides){
     name: "",
     businessType: "", // Agency | Startup | Personal Brand | Content Business | Freelancing | Other
     seasonGoal: "", // Build | Grow | Scale | Recover | Launch
+    updatedAt: Date.now(),
   }, overrides);
 }
 
@@ -2121,6 +2122,22 @@ function migrateState(state){
   if(state.schemaVersion < 17){
     if(state.integrations.google.refreshToken === undefined) state.integrations.google.refreshToken = null;
     state.schemaVersion = 17;
+  }
+  // v17 -> v18: fix a real cross-device sync gap. STATE.founder (name,
+  // business type, season goal — set once during onboarding) was never
+  // included in what gets synced to Drive, so a second device kept
+  // whatever placeholder name it started with even after a successful
+  // sync of everything else. Backfill updatedAt so the merge can compare
+  // it like every other synced record.
+  if(state.schemaVersion < 18){
+    // Backfill with 0 (not Date.now()) deliberately — using "now" here would
+    // create a race: whichever device loads this update second would stamp
+    // its OWN founder record (possibly still a placeholder name) as "newer"
+    // than the real one already pushed from another device, and the merge
+    // would wrongly keep the placeholder. 0 guarantees any real sync always
+    // wins the comparison, no matter which device updates first.
+    if(state.founder && state.founder.updatedAt === undefined) state.founder.updatedAt = 0;
+    state.schemaVersion = 18;
   }
   return state;
 }
@@ -3729,7 +3746,7 @@ async function driveUploadState(fileId, dataObj){
 }
 
 function buildSyncPayload(state){
-  const payload = { season: state.season, syncedAt: Date.now() };
+  const payload = { season: state.season, founder: state.founder, syncedAt: Date.now() };
   SYNC_COLLECTION_KEYS.forEach(k => { payload[k] = state[k]; });
   return payload;
 }
@@ -3773,6 +3790,7 @@ async function syncWithDrive(opts){
     if(remote){
       SYNC_COLLECTION_KEYS.forEach(key => { STATE[key] = mergeRecordArrays(STATE[key], remote[key]); });
       STATE.season = mergeSingleton(STATE.season, remote.season);
+      STATE.founder = mergeSingleton(STATE.founder, remote.founder);
     }
 
     saveState(); // persist the merged result locally — driveSyncInFlight guard prevents this from re-scheduling another sync
