@@ -1244,6 +1244,37 @@ kbd{
   .assistant-bubble{ max-width:90%; }
   .assistant-panel{ height:min(560px, 65vh); }
 }
+
+/* Voice widget — floating, persistent across every screen (see the HTML
+   comment near its markup for why it lives outside #app). */
+.voice-widget{
+  position: fixed; right: 20px; bottom: 20px; z-index: 450; /* above modal(400), below skip-link/splash(500) — never needs to compete with either */
+  display: flex; flex-direction: column; align-items: flex-end; gap: 10px;
+}
+.voice-mic-btn{
+  width: 52px; height: 52px; border-radius: 50%; border: 1px solid var(--panel-border);
+  background: var(--amber); color: var(--aw-text-on-primary, #1A1206);
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4); transition: transform var(--transition), background var(--transition);
+  flex-shrink: 0;
+}
+.voice-mic-btn svg{ width: 22px; height: 22px; }
+.voice-mic-btn:hover{ transform: scale(1.05); }
+.voice-mic-btn.listening{ background: var(--red, #e5484d); animation: voicePulse 1.4s ease-in-out infinite; }
+@keyframes voicePulse{
+  0%, 100%{ box-shadow: 0 4px 16px rgba(0,0,0,0.4), 0 0 0 0 rgba(229,72,77,0.5); }
+  50%{ box-shadow: 0 4px 16px rgba(0,0,0,0.4), 0 0 0 10px rgba(229,72,77,0); }
+}
+.voice-transcript{
+  max-width: 260px; padding: 8px 12px; border-radius: 10px; font-size: 12.5px; line-height: 1.4;
+  background: rgba(18,18,18,0.95); border: 1px solid var(--panel-border); color: var(--text-secondary);
+  display: none;
+}
+.voice-transcript.show{ display: block; }
+@media (max-width: 640px){
+  .voice-widget{ right: 14px; bottom: 84px; } /* clears the mobile bottom nav */
+  .voice-mic-btn{ width: 46px; height: 46px; }
+}
 </style>
 </head>
 <body>
@@ -1253,6 +1284,14 @@ kbd{
 <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 <div class="scrim" id="scrim"></div>
 <div class="modal-backdrop" id="modalBackdrop"><div class="modal" id="modalRoot" role="dialog" aria-modal="true"></div></div>
+
+<!-- Persistent across every view/render (same trick as the modal system
+     above) so voice works from onboarding, fullscreen focus mode, or any
+     screen — never wiped by renderApp()'s root.innerHTML swap. -->
+<div id="voiceWidget" class="voice-widget" style="display:none;">
+  <div class="voice-transcript" id="voiceTranscript"></div>
+  <button class="voice-mic-btn" id="voiceMicBtn" aria-label="Voice command" title="Voice command"></button>
+</div>
 
 <script>
 (function(){
@@ -1450,6 +1489,8 @@ const ICONS = {
   extcal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/><path d="M8 13h2M8 17h2M14 13h2M14 17h2"/></svg>',
   refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 4v5h-5"/></svg>',
   assistant: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3a7 7 0 0 0-7 7c0 2.4 1.15 4.53 2.93 5.87L7 21l3.5-1.8c.48.13.99.2 1.5.2a7 7 0 0 0 0-14Z"/><circle cx="9" cy="10" r="0.9" fill="currentColor" stroke="none"/><circle cx="12" cy="10" r="0.9" fill="currentColor" stroke="none"/><circle cx="15" cy="10" r="0.9" fill="currentColor" stroke="none"/></svg>',
+  mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 19v3M8 22h8"/></svg>',
+  micOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 2l20 20M9 9v3a3 3 0 0 0 4.6 2.55M15 9.4V5a3 3 0 0 0-5.9-.8M5 10a7 7 0 0 0 10.3 6.15M19 10a7 7 0 0 1-.6 2.85M12 19v3M8 22h8"/></svg>',
 };
 
 function icon(name){ return ICONS[name] || ""; }
@@ -3971,6 +4012,149 @@ function bindAssistantEvents(){
   }
   const messagesEl = document.getElementById("assistantMessages");
   if(messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+/* ==========================================================================
+   SECTION: VOICE (recognition + navigation commands + speech output)
+   Uses the browser's built-in Web Speech API — free, no API key, no
+   network request of ours involved. Real limitation, not hidden: this is
+   solid in Chrome/Edge, much weaker or absent in Safari/Firefox. The
+   widget simply doesn't appear at all in unsupported browsers (feature-
+   detected in initVoiceWidget) rather than showing something broken.
+
+   Scope, deliberately: voice can NAVIGATE ("open missions", "go to
+   settings") — matched directly against NAV_ITEMS labels, no AI involved,
+   so it's fast and can't misfire into the wrong screen. Anything that
+   isn't a recognized navigation phrase is sent to the Assistant as a
+   question, with the reply spoken back aloud (since asking by voice
+   usually means wanting to listen, not read). Voice-driven data changes
+   ("create a mission called...") are intentionally NOT built yet — that
+   needs the AI to reliably turn speech into a safe structured action, and
+   a misfire there silently creates wrong data rather than just annoying
+   the person. Worth adding once plain navigation + ask-by-voice prove out.
+   ========================================================================== */
+const VOICE = { recognition: null, listening: false, supported: false };
+
+function matchVoiceNavCommand(rawText){
+  const text = rawText.toLowerCase().trim();
+  const leadIns = ["go to", "open the", "open", "show me the", "show me", "show", "take me to", "navigate to", "switch to", "switch"];
+  let remainder = null;
+  for(const phrase of leadIns){
+    if(text.startsWith(phrase + " ")){
+      remainder = text.slice(phrase.length).trim();
+      break;
+    }
+  }
+  // Require an actual lead-in phrase before treating this as navigation at
+  // all — otherwise a plain sentence that happens to mention "missions"
+  // would wrongly jump screens instead of going to the Assistant.
+  if(!remainder) return null;
+  let best = null;
+  NAV_ITEMS.forEach(item => {
+    const label = item.label.toLowerCase();
+    if(remainder === label || remainder.includes(label) || label.includes(remainder)){
+      if(!best || label.length > best.labelLength) best = { id: item.id, labelLength: label.length };
+    }
+  });
+  return best ? best.id : null;
+}
+
+async function handleVoiceTranscript(text){
+  if(!text || !text.trim()) return;
+  const navTarget = matchVoiceNavCommand(text);
+  if(navTarget){
+    const item = NAV_ITEMS.find(n => n.id === navTarget);
+    navigateTo(navTarget);
+    showToast(`Opened ${item ? item.label : navTarget}`);
+    return;
+  }
+  // Not a recognized nav phrase — treat it as a question for the Assistant,
+  // and speak the reply back since this came in by voice.
+  STATE.ui.currentView = "assistant";
+  saveState();
+  renderApp();
+  await sendAssistantMessage(text);
+  const last = ASSISTANT_MESSAGES[ASSISTANT_MESSAGES.length - 1];
+  if(last && last.role === "assistant") speakText(last.content);
+}
+
+function speakText(text){
+  if(!window.speechSynthesis || !text) return;
+  window.speechSynthesis.cancel(); // don't let overlapping utterances stack up if triggered again mid-speech
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.rate = 1.0;
+  window.speechSynthesis.speak(utterance);
+}
+
+function startVoiceListening(){
+  if(!VOICE.supported || VOICE.listening) return;
+  const transcriptEl = document.getElementById("voiceTranscript");
+  const micBtn = document.getElementById("voiceMicBtn");
+  if(transcriptEl){ transcriptEl.textContent = "Listening…"; transcriptEl.classList.add("show"); }
+  if(micBtn) micBtn.classList.add("listening");
+  VOICE.listening = true;
+  try{ VOICE.recognition.start(); }catch(e){ /* already started this tick — harmless, ignore */ }
+}
+function stopVoiceListening(){
+  if(!VOICE.supported) return;
+  VOICE.listening = false;
+  const micBtn = document.getElementById("voiceMicBtn");
+  if(micBtn) micBtn.classList.remove("listening");
+  try{ VOICE.recognition.stop(); }catch(e){}
+  setTimeout(() => {
+    const transcriptEl = document.getElementById("voiceTranscript");
+    if(transcriptEl) transcriptEl.classList.remove("show");
+  }, 2500);
+}
+// Runs exactly ONCE, from initApp() — NOT from renderApp()/bindEvents(),
+// which run on every re-render. voiceWidget/voiceMicBtn live outside #app
+// (see the HTML comment near their markup) so they're never wiped by
+// renderApp()'s root.innerHTML swap; re-binding here on every render would
+// stack up duplicate click listeners on the same persistent button.
+function initVoiceWidget(){
+  const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const widget = document.getElementById("voiceWidget");
+  const micBtn = document.getElementById("voiceMicBtn");
+  if(!SpeechRecognitionCtor || !widget || !micBtn) return; // Unsupported browser (e.g. Firefox) — leave it hidden entirely rather than show something broken.
+
+  VOICE.supported = true;
+  micBtn.innerHTML = icon("mic");
+  widget.style.display = "flex";
+
+  VOICE.recognition = new SpeechRecognitionCtor();
+  VOICE.recognition.continuous = false;
+  VOICE.recognition.interimResults = true;
+  VOICE.recognition.lang = "en-US";
+
+  VOICE.recognition.onresult = (event) => {
+    let interim = "", final = "";
+    for(let i = event.resultIndex; i < event.results.length; i++){
+      const t = event.results[i][0].transcript;
+      if(event.results[i].isFinal) final += t; else interim += t;
+    }
+    const transcriptEl = document.getElementById("voiceTranscript");
+    if(transcriptEl){
+      transcriptEl.textContent = final || interim;
+      transcriptEl.classList.add("show");
+    }
+    if(final){
+      stopVoiceListening();
+      handleVoiceTranscript(final.trim());
+    }
+  };
+  VOICE.recognition.onerror = (event) => {
+    stopVoiceListening();
+    if(event.error !== "no-speech" && event.error !== "aborted") showToast(`Voice error: ${event.error}`);
+  };
+  VOICE.recognition.onend = () => {
+    VOICE.listening = false;
+    micBtn.classList.remove("listening");
+  };
+
+  micBtn.addEventListener("click", () => {
+    if(VOICE.listening) stopVoiceListening();
+    else startVoiceListening();
+  });
 }
 
 /* ==========================================================================
@@ -8225,6 +8409,7 @@ function initApp(){
       // Both are safe no-ops when there's nothing to restore.
       handleGoogleRedirectIfPresent();
       restoreMicrosoftSession();
+      initVoiceWidget(); // once only — see the function's own comment for why
     }).catch(renderFatalError);
   }catch(err){
     renderFatalError(err);
