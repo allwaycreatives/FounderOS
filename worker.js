@@ -91,7 +91,7 @@ async function handleGeminiChat(body, env) {
     parts: [{ text: m.content }],
   }));
 
-  const model = "gemini-1.5-flash"; // stable/production-ready per Google's own docs, generous free tier
+  const model = "gemini-3.5-flash"; // gemini-1.5-flash was sunset — this matches Google's own current official API reference example as of this writing
   let geminiResp;
   try {
     geminiResp = await fetch(
