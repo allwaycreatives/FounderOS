@@ -33,7 +33,7 @@ export default {
       return handleGoogleTokenExchange(request, env, url);
     }
     if (url.pathname === "/api/claude/chat") {
-      return handleClaudeChat(request, env);
+      return handleAssistantChat(request, env);
     }
 
     // Anything else: behave exactly like the old assets-only deployment.
@@ -42,18 +42,21 @@ export default {
 };
 
 /**
- * In-app Claude assistant. Same reasoning as the Notion/Google proxies —
- * ANTHROPIC_API_KEY is a Worker secret, never sent to the browser. This is
- * the founder's OWN Anthropic Console account and billing, separate from
- * (and unrelated to) whatever Claude product built this app.
+ * In-app assistant. Provider-agnostic on purpose — the client (index.html)
+ * always sends the same {system, messages} shape and always expects the
+ * same {content: [{type: "text", text: "..."}]} shape back, regardless of
+ * which real AI provider is behind it. Switching providers is a change
+ * entirely contained in this function; the UI never needs to know.
+ *
+ * Currently wired to Gemini (ASSISTANT_PROVIDER below) — Anthropic's
+ * Console required payment details upfront for this account, Gemini has a
+ * genuine no-card free tier, so Gemini is first. Switching back to Claude
+ * later means: set ASSISTANT_PROVIDER back to "anthropic" and add
+ * ANTHROPIC_API_KEY as a Worker secret — nothing else changes.
  */
-async function handleClaudeChat(request, env) {
-  if (!env.ANTHROPIC_API_KEY) {
-    return json(
-      { error: "ANTHROPIC_API_KEY is not configured on this Worker. Set it in Cloudflare dashboard > Settings > Variables and Secrets." },
-      500
-    );
-  }
+const ASSISTANT_PROVIDER = "gemini"; // "gemini" | "anthropic"
+
+async function handleAssistantChat(request, env) {
   if (request.method !== "POST") return json({ error: "POST only" }, 405);
 
   let body;
@@ -64,6 +67,79 @@ async function handleClaudeChat(request, env) {
   }
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return json({ error: "messages array is required" }, 400);
+  }
+
+  if (ASSISTANT_PROVIDER === "gemini") {
+    return handleGeminiChat(body, env);
+  }
+  return handleAnthropicChat(body, env);
+}
+
+async function handleGeminiChat(body, env) {
+  if (!env.GEMINI_API_KEY) {
+    return json(
+      { error: "GEMINI_API_KEY is not configured on this Worker. Set it in Cloudflare dashboard > Settings > Variables and Secrets." },
+      500
+    );
+  }
+
+  // Gemini's shape differs from Anthropic's: "model" instead of
+  // "assistant" for the AI's turns, and a separate systemInstruction field
+  // instead of a top-level "system" string.
+  const contents = body.messages.map(m => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
+
+  const model = "gemini-1.5-flash"; // stable/production-ready per Google's own docs, generous free tier
+  let geminiResp;
+  try {
+    geminiResp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": env.GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          contents,
+          systemInstruction: body.system ? { parts: [{ text: body.system }] } : undefined,
+          generationConfig: { maxOutputTokens: 1500 },
+        }),
+      }
+    );
+  } catch (err) {
+    return json({ error: `Couldn't reach Gemini: ${err.message || err}` }, 502);
+  }
+
+  const data = await geminiResp.json().catch(() => null);
+  if (!geminiResp.ok || !data) {
+    return json({ error: (data && data.error && data.error.message) || `Gemini request failed (${geminiResp.status})` }, geminiResp.status || 502);
+  }
+
+  // Translate Gemini's response shape into the same envelope the client
+  // already expects from Anthropic's Messages API — this is the one place
+  // that has to know about the difference.
+  const candidate = data.candidates && data.candidates[0];
+  const text = candidate && candidate.content && candidate.content.parts
+    ? candidate.content.parts.map(p => p.text || "").join("")
+    : "(no response)";
+  return json({ content: [{ type: "text", text }] }, 200);
+}
+
+/**
+ * In-app Claude assistant. Same reasoning as the Notion/Google proxies —
+ * ANTHROPIC_API_KEY is a Worker secret, never sent to the browser. This is
+ * the founder's OWN Anthropic Console account and billing, separate from
+ * (and unrelated to) whatever Claude product built this app.
+ */
+async function handleAnthropicChat(body, env) {
+  if (!env.ANTHROPIC_API_KEY) {
+    return json(
+      { error: "ANTHROPIC_API_KEY is not configured on this Worker. Set it in Cloudflare dashboard > Settings > Variables and Secrets." },
+      500
+    );
   }
 
   let anthropicResp;
@@ -88,6 +164,7 @@ async function handleClaudeChat(request, env) {
 
   const responseBody = await anthropicResp.text();
   return new Response(responseBody, {
+
     status: anthropicResp.status,
     headers: { "content-type": "application/json" },
   });
