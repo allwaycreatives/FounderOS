@@ -1247,6 +1247,15 @@ kbd{
 
 /* Voice widget — floating, persistent across every screen (see the HTML
    comment near its markup for why it lives outside #app). */
+/* Brand Profile (imported from BrandOS) */
+.brand-profile-grid{ display:flex; align-items:center; gap:var(--space-3); }
+.brand-profile-logo{ width:48px; height:48px; border-radius:10px; object-fit:contain; background:rgba(255,255,255,0.04); border:1px solid var(--panel-border); flex-shrink:0; padding:4px; box-sizing:border-box; }
+.brand-swatch{ display:inline-block; width:22px; height:22px; border-radius:6px; border:1px solid rgba(255,255,255,0.15); margin-right:6px; vertical-align:middle; }
+.brand-profile-field{ margin-top:var(--space-3); }
+.brand-profile-label{ font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-tertiary); margin-bottom:3px; }
+.brand-profile-field > div:last-child{ font-size:13px; color:var(--text-secondary); line-height:1.5; }
+.brand-profile-meta-row{ display:flex; gap:6px; flex-wrap:wrap; margin-top:var(--space-4); }
+
 .voice-widget{
   position: fixed; right: 20px; bottom: 20px; z-index: 450; /* above modal(400), below skip-link/splash(500) — never needs to compete with either */
   display: flex; flex-direction: column; align-items: flex-end; gap: 10px;
@@ -1304,7 +1313,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 18,
+  SCHEMA_VERSION: 19,
   APP_NAME: "Founder OS",
   APP_SUB: "Command Center",
   CURRENT_VERSION_LABEL: "v0.3 · Relationships & Notes",
@@ -1773,6 +1782,7 @@ function ContactModel(overrides){
     lastContactAt: null, // derived/updated whenever a communication is logged
     nextFollowUpAt: null,
     notes: "", // freeform: "likes phone calls, prefers morning meetings"
+    brandProfile: null, // imported from BrandOS's "Send to Founder OS" export — see importBrandProfileFromFile()
     createdAt: Date.now(),
     updatedAt: Date.now(),
   }, overrides);
@@ -2202,6 +2212,15 @@ function migrateState(state){
     // wins the comparison, no matter which device updates first.
     if(state.founder && state.founder.updatedAt === undefined) state.founder.updatedAt = 0;
     state.schemaVersion = 18;
+  }
+  // v18 -> v19: BrandOS import bridge. Contacts gain an optional
+  // brandProfile field — populated only when a "Send to Founder OS" export
+  // from BrandOS is imported on that contact's page. Nothing to backfill.
+  if(state.schemaVersion < 19){
+    state.contacts.forEach(c => {
+      if(c.brandProfile === undefined) c.brandProfile = null;
+    });
+    state.schemaVersion = 19;
   }
   return state;
 }
@@ -5405,6 +5424,63 @@ function renderContacts(){
   </div>`;
 }
 
+// Renders an imported BrandOS profile — see importBrandProfileFromFile()
+// for the shape being read here (bp.brand / bp.identity / bp.summary).
+function renderBrandProfileContent(bp){
+  const brand = bp.brand || {}, identity = bp.identity || {}, summary = bp.summary || {};
+  const swatch = (c) => `<span class="brand-swatch" style="background:${escapeHtml(c)};" title="${escapeHtml(c)}"></span>`;
+  const colors = [...(identity.primaryColors || []), ...(identity.secondaryColors || [])];
+  const pillars = (summary.contentPillars || []).map(p => `<span class="tag tag-neutral">${escapeHtml(p)}</span>`).join(" ");
+  const field = (label, value) => value ? `<div class="brand-profile-field"><div class="brand-profile-label">${escapeHtml(label)}</div><div>${escapeHtml(value)}</div></div>` : "";
+
+  return `
+    <div class="brand-profile-grid">
+      ${identity.logoDataUrl ? `<img src="${identity.logoDataUrl}" class="brand-profile-logo" alt="${escapeHtml(brand.name || "")} logo" />` : ""}
+      <div>
+        <div style="font-size:15px;font-weight:650;">${escapeHtml(brand.name || "Untitled Brand")}</div>
+        ${brand.category ? `<div style="font-size:12.5px;color:var(--text-tertiary);">${escapeHtml(brand.category)}</div>` : ""}
+      </div>
+    </div>
+    ${brand.description ? `<div style="font-size:13px;color:var(--text-secondary);margin:var(--space-3) 0;">${escapeHtml(brand.description)}</div>` : ""}
+    ${colors.length ? `<div style="margin-bottom:var(--space-3);">${colors.map(swatch).join("")}</div>` : ""}
+    ${field("Vision", summary.vision)}
+    ${field("Mission", summary.mission)}
+    ${field("Core Message", summary.coreMessage)}
+    ${field("Tone of Voice", identity.toneOfVoice)}
+    ${pillars ? `<div class="brand-profile-field"><div class="brand-profile-label">Content Pillars</div><div>${pillars}</div></div>` : ""}
+    <div class="brand-profile-meta-row">
+      ${summary.platformPrimary ? `<span class="tag tag-neutral">Primary: ${escapeHtml(summary.platformPrimary)}</span>` : ""}
+      ${summary.postingFrequency ? `<span class="tag tag-neutral">${escapeHtml(summary.postingFrequency)}</span>` : ""}
+      ${summary.productionStyle ? `<span class="tag tag-neutral">${escapeHtml(summary.productionStyle)}</span>` : ""}
+    </div>
+    <div style="font-size:11px;color:var(--text-tertiary);margin-top:var(--space-3);">Imported ${escapeHtml(timeAgo(bp.importedAt))}</div>
+  `;
+}
+async function importBrandProfileFromFile(contactId, file){
+  const contact = contactById(contactId);
+  if(!contact || !file) return;
+  try{
+    const text = await file.text();
+    const data = JSON.parse(text);
+    if(data.schema !== "founderos-client-import-v1"){
+      showToast("This doesn't look like a Brand OS export made for Founder OS");
+      return;
+    }
+    contact.brandProfile = {
+      brand: data.brand || {},
+      identity: data.identity || {},
+      summary: data.summary || {},
+      importedAt: Date.now(),
+    };
+    contact.updatedAt = Date.now();
+    saveState();
+    showToast(`Imported brand profile for ${contact.name}`);
+    renderApp();
+  }catch(err){
+    showToast(`Couldn't import file: ${err.message || err}`);
+  }
+}
+
 function renderContactDetail(contact){
   const biz = contact.businessId ? businessById(contact.businessId) : null;
   const comms = communicationsForContact(contact.id);
@@ -5491,6 +5567,15 @@ function renderContactDetail(contact){
         <h3 class="card-title"><span class="card-icon">${icon("folder")}</span>Projects &amp; Deliverables</h3>
         ${clientProjectRows || emptyState("folder", "No projects linked yet", "Create a project (or edit an existing one) and set this person as the Client to see it here.")}
         <button class="btn btn-ghost btn-sm" data-action="new-client-project" data-id="${contact.id}" style="margin-top:var(--space-3);">${icon("plus")} New project for ${escapeHtml(contact.name)}</button>
+      </div>
+
+      <div class="card glass col-12">
+        <h3 class="card-title"><span class="card-icon">${icon("externalApp")}</span>Brand Profile${contact.brandProfile ? ` <span class="tag tag-neutral" style="margin-left:6px;">from Brand OS</span>` : ""}</h3>
+        ${contact.brandProfile
+          ? renderBrandProfileContent(contact.brandProfile)
+          : `<div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-3);">Import a "Send to Founder OS" export from Brand OS's Summary screen to see this client's brand discovery here — Vision, Content Pillars, tone of voice, colors, and more.</div>`}
+        <input type="file" id="brandProfileFileInput-${contact.id}" accept="application/json" style="display:none;" data-contact-id="${contact.id}" />
+        <button class="btn btn-ghost btn-sm" data-action="import-brand-profile" data-id="${contact.id}" style="margin-top:var(--space-3);">${icon("externalApp")} ${contact.brandProfile ? "Re-import / Update" : "Import from Brand OS"}</button>
       </div>` : ""}
 
       <div class="card glass col-12">
@@ -8128,6 +8213,19 @@ function bindJournalEvents(){
 
 /* ---- Contacts bindings ---- */
 function bindContactsEvents(){
+  document.querySelectorAll('[data-action="import-brand-profile"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      const fileInput = document.getElementById(`brandProfileFileInput-${btn.getAttribute("data-id")}`);
+      if(fileInput) fileInput.click();
+    });
+  });
+  document.querySelectorAll('input[id^="brandProfileFileInput-"]').forEach(input => {
+    input.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if(file) importBrandProfileFromFile(input.getAttribute("data-contact-id"), file);
+      e.target.value = ""; // allow re-importing the same filename again later
+    });
+  });
   document.querySelectorAll('[data-action="open-contact"]').forEach(card => {
     card.addEventListener("click", () => {
       STATE.ui.contactFocusId = card.getAttribute("data-id");
