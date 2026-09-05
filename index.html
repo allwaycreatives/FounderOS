@@ -1491,6 +1491,7 @@ const ICONS = {
   assistant: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3a7 7 0 0 0-7 7c0 2.4 1.15 4.53 2.93 5.87L7 21l3.5-1.8c.48.13.99.2 1.5.2a7 7 0 0 0 0-14Z"/><circle cx="9" cy="10" r="0.9" fill="currentColor" stroke="none"/><circle cx="12" cy="10" r="0.9" fill="currentColor" stroke="none"/><circle cx="15" cy="10" r="0.9" fill="currentColor" stroke="none"/></svg>',
   mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 19v3M8 22h8"/></svg>',
   micOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 2l20 20M9 9v3a3 3 0 0 0 4.6 2.55M15 9.4V5a3 3 0 0 0-5.9-.8M5 10a7 7 0 0 0 10.3 6.15M19 10a7 7 0 0 1-.6 2.85M12 19v3M8 22h8"/></svg>',
+  externalApp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M17.5 14v3.2M15.8 15.8h3.4"/></svg>',
 };
 
 function icon(name){ return ICONS[name] || ""; }
@@ -6859,6 +6860,7 @@ function renderSidebar(){
       ${items}
     </nav>
     <div class="sidebar-footer">
+      <a class="collapse-btn" href="https://brandos.allwaycreatives.workers.dev/" target="_blank" rel="noopener" style="margin-bottom:6px; text-decoration:none;">${icon("externalApp")}<span>Brand OS &rarr;</span></a>
       <button class="collapse-btn" data-action="open-help-center" style="margin-bottom:6px;">${icon("help")}<span>Help &amp; Shortcuts</span></button>
       <button class="collapse-btn" id="collapseBtn">${icon("chevron")}<span>Collapse</span></button>
     </div>
