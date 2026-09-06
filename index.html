@@ -8485,6 +8485,74 @@ function preloadCoreFonts(){
   return Promise.race([requests, timeout]);
 }
 
+/* --------------------------------------------------------------------------
+   BRANDOS BRIDGE (receiving side)
+   Companion to BrandOS's "Send to Founder OS" button — browser-to-browser
+   via postMessage, no download/upload round-trip, no backend on either
+   side. Wired once at top-level script scope (not inside initApp/renderApp)
+   since `window` itself persists for the page's whole lifetime regardless
+   of re-renders — no re-wiring-on-every-render concern here.
+   -------------------------------------------------------------------------- */
+const BRANDOS_ORIGIN = "https://brandos.allwaycreatives.workers.dev";
+
+function openBrandImportAttachModal(payload){
+  const brand = payload.brand || {};
+  const clients = STATE.contacts.filter(c => c.category === "Client");
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">Brand profile received from Brand OS</div>
+      <button class="modal-close" data-modal-close>${icon("close")}</button>
+    </div>
+    <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);">
+      "${escapeHtml(brand.name || "Untitled brand")}" — attach this to which client?
+    </div>
+    <form id="brandImportAttachForm">
+      <div class="field">
+        <label class="field-label">Client</label>
+        <select class="field-select" id="brandImportContactSelect">
+          <option value="">— Create a new client named "${escapeHtml(brand.name || "New Client")}" —</option>
+          ${clients.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("")}
+        </select>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-ghost" data-modal-close>Dismiss</button>
+        <button type="submit" class="btn btn-primary">${icon("externalApp")} Attach</button>
+      </div>
+    </form>
+  `, (root) => {
+    root.querySelector("#brandImportAttachForm").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const select = root.querySelector("#brandImportContactSelect");
+      const contact = select.value
+        ? contactById(select.value)
+        : createContact({ name: brand.name || "New Client", category: "Client", notes: brand.description || "" });
+      contact.brandProfile = { brand: payload.brand || {}, identity: payload.identity || {}, summary: payload.summary || {}, importedAt: Date.now() };
+      contact.updatedAt = Date.now();
+      saveState();
+      closeModal();
+      STATE.ui.contactFocusId = contact.id;
+      STATE.ui.currentView = "contacts";
+      saveState();
+      renderApp();
+      showToast(`Attached brand profile to ${contact.name}`);
+    });
+  });
+}
+
+window.addEventListener("message", (event) => {
+  if(event.origin !== BRANDOS_ORIGIN) return;
+  if(!(event.data && event.data.type === "brandos-export" && event.data.schema === "founderos-client-import-v1")) return;
+  // Ack immediately regardless of app state below — this is what stops
+  // BrandOS's retry loop, separate from whether we're ready to act on it yet.
+  event.source.postMessage({ type: "founderos-import-ack" }, event.origin);
+  if(!STATE || !STATE.meta) return; // arrived before initApp() finished — practically never, but don't crash if it does
+  if(STATE.meta.onboardingComplete){
+    openBrandImportAttachModal(event.data.payload || {});
+  }else{
+    showToast("Received a brand profile from Brand OS — finish setup here first, then check Contacts");
+  }
+});
+
 function initApp(){
   try{
     const root = document.getElementById("app");
