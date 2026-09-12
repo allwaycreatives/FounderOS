@@ -1270,6 +1270,19 @@ kbd{
 .voice-mic-btn svg{ width: 22px; height: 22px; }
 .voice-mic-btn:hover{ transform: scale(1.05); }
 .voice-mic-btn.listening{ background: var(--red, #e5484d); animation: voicePulse 1.4s ease-in-out infinite; }
+/* Deliberately a different color from the mic button — visually distinct
+   at a glance, since they do genuinely different things (this one is the
+   "Shazam button": tap, speak, instantly saved to Idea Vault, nothing else). */
+.voice-capture-btn{
+  width: 44px; height: 44px; border-radius: 50%; border: 1px solid var(--panel-border);
+  background: var(--blue); color: #fff;
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.4); transition: transform var(--transition), background var(--transition);
+  flex-shrink: 0;
+}
+.voice-capture-btn svg{ width: 19px; height: 19px; }
+.voice-capture-btn:hover{ transform: scale(1.05); }
+.voice-capture-btn.listening{ background: var(--red, #e5484d); animation: voicePulse 1.4s ease-in-out infinite; }
 @keyframes voicePulse{
   0%, 100%{ box-shadow: 0 4px 16px rgba(0,0,0,0.4), 0 0 0 0 rgba(229,72,77,0.5); }
   50%{ box-shadow: 0 4px 16px rgba(0,0,0,0.4), 0 0 0 10px rgba(229,72,77,0); }
@@ -1299,6 +1312,7 @@ kbd{
      screen — never wiped by renderApp()'s root.innerHTML swap. -->
 <div id="voiceWidget" class="voice-widget" style="display:none;">
   <div class="voice-transcript" id="voiceTranscript"></div>
+  <button class="voice-capture-btn" id="voiceCaptureBtn" aria-label="Quick capture an idea" title="Quick capture an idea"></button>
   <button class="voice-mic-btn" id="voiceMicBtn" aria-label="Voice command" title="Voice command"></button>
 </div>
 
@@ -4053,7 +4067,7 @@ function bindAssistantEvents(){
    a misfire there silently creates wrong data rather than just annoying
    the person. Worth adding once plain navigation + ask-by-voice prove out.
    ========================================================================== */
-const VOICE = { recognition: null, listening: false, supported: false };
+const VOICE = { recognition: null, listening: false, supported: false, mode: "command" };
 
 function matchVoiceNavCommand(rawText){
   const text = rawText.toLowerCase().trim();
@@ -4097,6 +4111,20 @@ async function handleVoiceTranscript(text){
   const last = ASSISTANT_MESSAGES[ASSISTANT_MESSAGES.length - 1];
   if(last && last.role === "assistant") speakText(last.content);
 }
+// The "Shazam button" — deliberately dumb and instant on purpose: no nav
+// matching, no AI round-trip, no ambiguity about what it does. Tap, speak,
+// it's saved to the Idea Vault immediately (captureIdea is pure local
+// state, always succeeds even offline). Confirmation is immediate too —
+// the whole point is zero friction for a thought you don't want to lose.
+function handleVoiceCapture(text){
+  if(!text || !text.trim()) return;
+  const idea = captureIdea(text);
+  if(!idea) return;
+  const preview = text.length > 50 ? text.slice(0, 47) + "…" : text;
+  showToast(`💡 Captured: "${preview}"`);
+  speakText("Got it.");
+  if(STATE.ui.currentView === "ideavault") renderApp(); // only re-render if they're already looking at the list — no need to interrupt whatever else they're doing
+}
 
 function speakText(text){
   if(!window.speechSynthesis || !text) return;
@@ -4106,20 +4134,24 @@ function speakText(text){
   window.speechSynthesis.speak(utterance);
 }
 
-function startVoiceListening(){
+function activeVoiceButton(){
+  return document.getElementById(VOICE.mode === "capture" ? "voiceCaptureBtn" : "voiceMicBtn");
+}
+function startVoiceListening(mode){
   if(!VOICE.supported || VOICE.listening) return;
+  VOICE.mode = mode || "command";
   const transcriptEl = document.getElementById("voiceTranscript");
-  const micBtn = document.getElementById("voiceMicBtn");
-  if(transcriptEl){ transcriptEl.textContent = "Listening…"; transcriptEl.classList.add("show"); }
-  if(micBtn) micBtn.classList.add("listening");
+  const btn = activeVoiceButton();
+  if(transcriptEl){ transcriptEl.textContent = VOICE.mode === "capture" ? "Listening for your idea…" : "Listening…"; transcriptEl.classList.add("show"); }
+  if(btn) btn.classList.add("listening");
   VOICE.listening = true;
   try{ VOICE.recognition.start(); }catch(e){ /* already started this tick — harmless, ignore */ }
 }
 function stopVoiceListening(){
   if(!VOICE.supported) return;
   VOICE.listening = false;
-  const micBtn = document.getElementById("voiceMicBtn");
-  if(micBtn) micBtn.classList.remove("listening");
+  const btn = activeVoiceButton();
+  if(btn) btn.classList.remove("listening");
   try{ VOICE.recognition.stop(); }catch(e){}
   setTimeout(() => {
     const transcriptEl = document.getElementById("voiceTranscript");
@@ -4135,10 +4167,12 @@ function initVoiceWidget(){
   const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
   const widget = document.getElementById("voiceWidget");
   const micBtn = document.getElementById("voiceMicBtn");
-  if(!SpeechRecognitionCtor || !widget || !micBtn) return; // Unsupported browser (e.g. Firefox) — leave it hidden entirely rather than show something broken.
+  const captureBtn = document.getElementById("voiceCaptureBtn");
+  if(!SpeechRecognitionCtor || !widget || !micBtn || !captureBtn) return; // Unsupported browser (e.g. Firefox) — leave it hidden entirely rather than show something broken.
 
   VOICE.supported = true;
   micBtn.innerHTML = icon("mic");
+  captureBtn.innerHTML = icon("bulb");
   widget.style.display = "flex";
 
   VOICE.recognition = new SpeechRecognitionCtor();
@@ -4158,8 +4192,10 @@ function initVoiceWidget(){
       transcriptEl.classList.add("show");
     }
     if(final){
+      const mode = VOICE.mode;
       stopVoiceListening();
-      handleVoiceTranscript(final.trim());
+      if(mode === "capture") handleVoiceCapture(final.trim());
+      else handleVoiceTranscript(final.trim());
     }
   };
   VOICE.recognition.onerror = (event) => {
@@ -4169,11 +4205,16 @@ function initVoiceWidget(){
   VOICE.recognition.onend = () => {
     VOICE.listening = false;
     micBtn.classList.remove("listening");
+    captureBtn.classList.remove("listening");
   };
 
   micBtn.addEventListener("click", () => {
     if(VOICE.listening) stopVoiceListening();
-    else startVoiceListening();
+    else startVoiceListening("command");
+  });
+  captureBtn.addEventListener("click", () => {
+    if(VOICE.listening) stopVoiceListening();
+    else startVoiceListening("capture");
   });
 }
 
