@@ -35,6 +35,9 @@ export default {
     if (url.pathname === "/api/claude/chat") {
       return handleAssistantChat(request, env);
     }
+    if (url.pathname === "/api/voice/capture") {
+      return handleVoiceCapture(request, env);
+    }
 
     // Anything else: behave exactly like the old assets-only deployment.
     return env.ASSETS.fetch(request);
@@ -126,6 +129,109 @@ async function handleGeminiChat(body, env) {
     ? candidate.content.parts.map(p => p.text || "").join("")
     : "(no response)";
   return json({ content: [{ type: "text", text }] }, 200);
+}
+
+/**
+ * Voice capture ("idea button"). One round-trip that both transcribes an
+ * audio memo and suggests which existing business/project it belongs to,
+ * so the client only needs a single request and a single confirm step.
+ * Same provider-agnostic reasoning as the assistant chat above — Gemini
+ * today (already has a working key on this Worker), swappable later.
+ * The audio is relayed straight through to Gemini and never stored here
+ * or anywhere else server-side.
+ */
+async function handleVoiceCapture(request, env) {
+  if (request.method !== "POST") return json({ error: "POST only" }, 405);
+  if (!env.GEMINI_API_KEY) {
+    return json(
+      { error: "GEMINI_API_KEY is not configured on this Worker. Set it in Cloudflare dashboard > Settings > Variables and Secrets." },
+      500
+    );
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+  if (!body.audioBase64 || !body.mimeType) {
+    return json({ error: "audioBase64 and mimeType are required" }, 400);
+  }
+
+  const businesses = Array.isArray(body.businesses) ? body.businesses : [];
+  const projects = Array.isArray(body.projects) ? body.projects : [];
+  const catalog = [
+    ...businesses.map(b => `business:${b.id} — ${b.name}`),
+    ...projects.map(p => `project:${p.id} — ${p.name}`),
+  ].join("\n");
+
+  // Asking for transcript + classification in the same call (rather than
+  // two round-trips) keeps this fast enough to feel instant on a phone.
+  const instruction = `Transcribe the attached voice memo exactly, word for word. Then, using ONLY this list of the founder's businesses and projects, decide whether the memo clearly belongs to one of them:
+${catalog || "(none defined yet — always respond with matchType none)"}
+
+Respond with ONLY this JSON object, no markdown fencing, no commentary:
+{"transcript": "...", "matchType": "business" | "project" | "none", "matchId": "the id portion after the colon above, or null", "confidence": 0.0 to 1.0}
+
+Only choose a match if the memo clearly names or strongly, unambiguously implies that specific business or project. If there's any real doubt, use "none" and confidence 0.`;
+
+  let geminiResp;
+  try {
+    geminiResp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": env.GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [{
+            role: "user",
+            parts: [
+              { text: instruction },
+              { inlineData: { mimeType: body.mimeType, data: body.audioBase64 } },
+            ],
+          }],
+          generationConfig: { maxOutputTokens: 800, responseMimeType: "application/json" },
+        }),
+      }
+    );
+  } catch (err) {
+    return json({ error: `Couldn't reach Gemini: ${err.message || err}` }, 502);
+  }
+
+  const data = await geminiResp.json().catch(() => null);
+  if (!geminiResp.ok || !data) {
+    return json(
+      { error: (data && data.error && data.error.message) || `Gemini request failed (${geminiResp.status})` },
+      geminiResp.status || 502
+    );
+  }
+
+  const candidate = data.candidates && data.candidates[0];
+  const raw = candidate && candidate.content && candidate.content.parts
+    ? candidate.content.parts.map(p => p.text || "").join("")
+    : "";
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    // Model didn't return clean JSON (rare, but responseMimeType isn't a
+    // hard guarantee) — still surface the raw text as the transcript
+    // rather than failing the capture outright. An idea with no match is
+    // always safe to fall back to.
+    parsed = { transcript: raw.trim(), matchType: "none", matchId: null, confidence: 0 };
+  }
+
+  return json({
+    transcript: parsed.transcript || "",
+    matchType: parsed.matchType === "business" || parsed.matchType === "project" ? parsed.matchType : "none",
+    matchId: parsed.matchId || null,
+    confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
+  }, 200);
 }
 
 /**

@@ -1293,6 +1293,12 @@ kbd{
   display: none;
 }
 .voice-transcript.show{ display: block; }
+.voice-capture-btn.capture-pop{ animation: captureBounce 0.45s cubic-bezier(.34,1.56,.64,1); }
+@keyframes captureBounce{
+  0%{ transform: scale(1); }
+  35%{ transform: scale(1.28); background: var(--amber, #ED8D01); }
+  100%{ transform: scale(1); }
+}
 @media (max-width: 640px){
   .voice-widget{ right: 14px; bottom: 84px; } /* clears the mobile bottom nav */
   .voice-mic-btn{ width: 46px; height: 46px; }
@@ -1327,7 +1333,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 19,
+  SCHEMA_VERSION: 20,
   APP_NAME: "Founder OS",
   APP_SUB: "Command Center",
   CURRENT_VERSION_LABEL: "v0.3 · Relationships & Notes",
@@ -1741,6 +1747,14 @@ function IdeaModel(overrides){
     text: "",
     status: "inbox", // inbox | assigned | archived
     projectId: null,
+    // Voice-capture-only fields. pendingTranscription: true means this
+    // idea is a placeholder for an offline voice memo whose audio hasn't
+    // been transcribed yet — voiceQueueId points at the blob sitting in
+    // IndexedDB on THIS device (see VOICE QUEUE section). Audio never
+    // syncs across devices, only the eventual transcript text does, so
+    // transcription must happen on the device that captured it.
+    pendingTranscription: false,
+    voiceQueueId: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
   }, overrides);
@@ -2235,6 +2249,16 @@ function migrateState(state){
       if(c.brandProfile === undefined) c.brandProfile = null;
     });
     state.schemaVersion = 19;
+  }
+  // v19 -> v20: offline voice capture. Existing ideas never had these
+  // fields, so they're always "not pending" — only ideas created by the
+  // new record-while-offline flow ever set pendingTranscription true.
+  if(state.schemaVersion < 20){
+    state.ideas.forEach(i => {
+      if(i.pendingTranscription === undefined) i.pendingTranscription = false;
+      if(i.voiceQueueId === undefined) i.voiceQueueId = null;
+    });
+    state.schemaVersion = 20;
   }
   return state;
 }
@@ -4050,11 +4074,21 @@ function bindAssistantEvents(){
 
 /* ==========================================================================
    SECTION: VOICE (recognition + navigation commands + speech output)
-   Uses the browser's built-in Web Speech API — free, no API key, no
-   network request of ours involved. Real limitation, not hidden: this is
-   solid in Chrome/Edge, much weaker or absent in Safari/Firefox. The
-   widget simply doesn't appear at all in unsupported browsers (feature-
-   detected in initVoiceWidget) rather than showing something broken.
+   Two independent paths, gated separately in initVoiceWidget:
+   - The MIC button ("command" mode) still uses the browser's built-in Web
+     Speech API — free, instant, no network request of ours. Solid in
+     Chrome/Edge, weak or absent in Safari/Firefox, so this button simply
+     doesn't appear in unsupported browsers.
+   - The CAPTURE button ("idea button") now prefers MediaRecorder: record
+     real audio, send it to this Worker's /api/voice/capture, get back a
+     transcript plus a best-guess business/project match. This works the
+     same way in Chrome, Android, and iOS Safari/PWA — unlike Speech
+     Recognition, which is unreliable on iOS — and survives being offline
+     (the recording queues in IndexedDB and transcribes once back online).
+     If a browser somehow has neither MediaRecorder nor Speech Recognition,
+     capture falls back to the old live-transcribe path below rather than
+     disappearing outright. See VOICE QUEUE section further down for the
+     offline plumbing.
 
    Scope, deliberately: voice can NAVIGATE ("open missions", "go to
    settings") — matched directly against NAV_ITEMS labels, no AI involved,
@@ -4067,7 +4101,12 @@ function bindAssistantEvents(){
    a misfire there silently creates wrong data rather than just annoying
    the person. Worth adding once plain navigation + ask-by-voice prove out.
    ========================================================================== */
-const VOICE = { recognition: null, listening: false, supported: false, mode: "command" };
+const VOICE = {
+  recognition: null, listening: false, supported: false, mode: "command",
+  // MediaRecorder-based capture (the "idea button"), independent of the
+  // recognition fields above.
+  recordingMemo: false, mediaRecorder: null, mediaChunks: [], mediaStream: null,
+};
 
 function matchVoiceNavCommand(rawText){
   const text = rawText.toLowerCase().trim();
@@ -4163,59 +4202,375 @@ function stopVoiceListening(){
 // (see the HTML comment near their markup) so they're never wiped by
 // renderApp()'s root.innerHTML swap; re-binding here on every render would
 // stack up duplicate click listeners on the same persistent button.
+function mediaRecorderSupported(){
+  return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+}
+
 function initVoiceWidget(){
   const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
   const widget = document.getElementById("voiceWidget");
   const micBtn = document.getElementById("voiceMicBtn");
   const captureBtn = document.getElementById("voiceCaptureBtn");
-  if(!SpeechRecognitionCtor || !widget || !micBtn || !captureBtn) return; // Unsupported browser (e.g. Firefox) — leave it hidden entirely rather than show something broken.
+  if(!widget || !micBtn || !captureBtn) return;
 
-  VOICE.supported = true;
-  micBtn.innerHTML = icon("mic");
-  captureBtn.innerHTML = icon("bulb");
+  const commandSupported = !!SpeechRecognitionCtor;
+  const captureSupported = mediaRecorderSupported() || commandSupported;
+  if(!commandSupported && !captureSupported) return; // Genuinely unsupported browser — leave hidden rather than show something broken.
+
   widget.style.display = "flex";
 
-  VOICE.recognition = new SpeechRecognitionCtor();
-  VOICE.recognition.continuous = false;
-  VOICE.recognition.interimResults = true;
-  VOICE.recognition.lang = "en-US";
-
-  VOICE.recognition.onresult = (event) => {
-    let interim = "", final = "";
-    for(let i = event.resultIndex; i < event.results.length; i++){
-      const t = event.results[i][0].transcript;
-      if(event.results[i].isFinal) final += t; else interim += t;
-    }
-    const transcriptEl = document.getElementById("voiceTranscript");
-    if(transcriptEl){
-      transcriptEl.textContent = final || interim;
-      transcriptEl.classList.add("show");
-    }
-    if(final){
-      const mode = VOICE.mode;
+  if(commandSupported){
+    VOICE.supported = true;
+    micBtn.innerHTML = icon("mic");
+    micBtn.style.display = "";
+    VOICE.recognition = new SpeechRecognitionCtor();
+    VOICE.recognition.continuous = false;
+    VOICE.recognition.interimResults = true;
+    VOICE.recognition.lang = "en-US";
+    VOICE.recognition.onresult = (event) => {
+      let interim = "", final = "";
+      for(let i = event.resultIndex; i < event.results.length; i++){
+        const t = event.results[i][0].transcript;
+        if(event.results[i].isFinal) final += t; else interim += t;
+      }
+      const transcriptEl = document.getElementById("voiceTranscript");
+      if(transcriptEl){
+        transcriptEl.textContent = final || interim;
+        transcriptEl.classList.add("show");
+      }
+      if(final){
+        const mode = VOICE.mode;
+        stopVoiceListening();
+        if(mode === "capture") handleVoiceCapture(final.trim());
+        else handleVoiceTranscript(final.trim());
+      }
+    };
+    VOICE.recognition.onerror = (event) => {
       stopVoiceListening();
-      if(mode === "capture") handleVoiceCapture(final.trim());
-      else handleVoiceTranscript(final.trim());
-    }
-  };
-  VOICE.recognition.onerror = (event) => {
-    stopVoiceListening();
-    if(event.error !== "no-speech" && event.error !== "aborted") showToast(`Voice error: ${event.error}`);
-  };
-  VOICE.recognition.onend = () => {
-    VOICE.listening = false;
-    micBtn.classList.remove("listening");
-    captureBtn.classList.remove("listening");
-  };
+      if(event.error !== "no-speech" && event.error !== "aborted") showToast(`Voice error: ${event.error}`);
+    };
+    VOICE.recognition.onend = () => {
+      VOICE.listening = false;
+      micBtn.classList.remove("listening");
+      captureBtn.classList.remove("listening");
+    };
+    micBtn.addEventListener("click", () => {
+      if(VOICE.listening) stopVoiceListening();
+      else startVoiceListening("command");
+    });
+  }else{
+    micBtn.style.display = "none"; // No Speech Recognition in this browser — nav-by-voice just isn't offered, capture can still work below.
+  }
 
-  micBtn.addEventListener("click", () => {
-    if(VOICE.listening) stopVoiceListening();
-    else startVoiceListening("command");
+  captureBtn.innerHTML = icon("bulb");
+  if(mediaRecorderSupported()){
+    // Preferred path: real audio, works the same on iOS/Android/desktop,
+    // survives being offline. See VOICE QUEUE section for the recording
+    // and offline-flush logic itself.
+    captureBtn.addEventListener("click", () => {
+      if(VOICE.recordingMemo) stopVoiceMemoRecording();
+      else startVoiceMemoRecording();
+    });
+  }else if(commandSupported){
+    // Fallback for a browser with Speech Recognition but no MediaRecorder
+    // (uncommon, but possible on older builds) — old live-transcribe path.
+    captureBtn.addEventListener("click", () => {
+      if(VOICE.listening) stopVoiceListening();
+      else startVoiceListening("capture");
+    });
+  }else{
+    captureBtn.style.display = "none";
+  }
+}
+
+/* ==========================================================================
+   SECTION: VOICE QUEUE (offline-capable idea capture)
+   The "idea button" records real audio with MediaRecorder, then either:
+   (a) sends it straight to /api/voice/capture and gets back a transcript
+       plus a suggested business/project match, or
+   (b) if that request fails for any reason (offline, flaky connection,
+       server error), stores the raw audio blob in IndexedDB and leaves a
+       visible placeholder idea in place — capture always succeeds
+       instantly; transcription catches up whenever it can.
+   IndexedDB (not localStorage) holds the audio: blobs are too large for
+   the single JSON blob localStorage/Drive-sync already push around, and
+   audio never needs to leave this device anyway — only the eventual
+   transcript text does. One real consequence of that: a memo recorded
+   offline can only finish transcribing on the SAME device that recorded
+   it, once THAT device is back online — but the placeholder idea itself
+   is a normal synced record, so it already shows up (as "transcribing…")
+   on every other device as soon as this device's next Drive sync runs.
+   ========================================================================== */
+const VOICE_DB_NAME = "founderos-voice-queue";
+const VOICE_STORE_NAME = "pending";
+
+function openVoiceDB(){
+  return new Promise((resolve, reject) => {
+    if(!window.indexedDB){ reject(new Error("IndexedDB unavailable")); return; }
+    const req = indexedDB.open(VOICE_DB_NAME, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(VOICE_STORE_NAME, { keyPath: "id" }); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
   });
-  captureBtn.addEventListener("click", () => {
-    if(VOICE.listening) stopVoiceListening();
-    else startVoiceListening("capture");
+}
+async function voiceQueueSave(id, blob, mimeType){
+  const db = await openVoiceDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(VOICE_STORE_NAME, "readwrite");
+    tx.objectStore(VOICE_STORE_NAME).put({ id, blob, mimeType, queuedAt: Date.now() });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
   });
+}
+async function voiceQueueAll(){
+  const db = await openVoiceDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(VOICE_STORE_NAME, "readonly");
+    const req = tx.objectStore(VOICE_STORE_NAME).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function voiceQueueDelete(id){
+  const db = await openVoiceDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(VOICE_STORE_NAME, "readwrite");
+    tx.objectStore(VOICE_STORE_NAME).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+function blobToBase64(blob){
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(String(reader.result).split(",")[1] || "");
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+function pickRecorderMimeType(){
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/aac"];
+  for(const c of candidates){ if(window.MediaRecorder.isTypeSupported(c)) return c; }
+  return ""; // let the browser choose its own default
+}
+
+async function startVoiceMemoRecording(){
+  if(VOICE.recordingMemo) return;
+  let stream;
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  }catch(err){
+    showToast("Microphone access denied or unavailable");
+    return;
+  }
+  const mimeType = pickRecorderMimeType();
+  const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+  VOICE.mediaStream = stream;
+  VOICE.mediaRecorder = recorder;
+  VOICE.mediaChunks = [];
+  recorder.ondataavailable = (e) => { if(e.data && e.data.size > 0) VOICE.mediaChunks.push(e.data); };
+  recorder.onstop = () => {
+    stream.getTracks().forEach(t => t.stop());
+    const finalMimeType = recorder.mimeType || mimeType || "audio/webm";
+    const blob = new Blob(VOICE.mediaChunks, { type: finalMimeType });
+    VOICE.mediaChunks = [];
+    handleVoiceMemoRecorded(blob, finalMimeType);
+  };
+  recorder.start();
+  VOICE.recordingMemo = true;
+  const btn = document.getElementById("voiceCaptureBtn");
+  if(btn) btn.classList.add("listening");
+  const transcriptEl = document.getElementById("voiceTranscript");
+  if(transcriptEl){ transcriptEl.textContent = "Recording your idea… tap again to finish"; transcriptEl.classList.add("show"); }
+}
+function stopVoiceMemoRecording(){
+  if(!VOICE.recordingMemo || !VOICE.mediaRecorder) return;
+  VOICE.recordingMemo = false;
+  const btn = document.getElementById("voiceCaptureBtn");
+  if(btn) btn.classList.remove("listening");
+  try{ VOICE.mediaRecorder.stop(); }catch(e){}
+  setTimeout(() => {
+    const transcriptEl = document.getElementById("voiceTranscript");
+    if(transcriptEl) transcriptEl.classList.remove("show");
+  }, 1200);
+}
+
+// Fired the moment recording stops. Always creates a visible idea
+// immediately — so capture never feels like it silently did nothing —
+// then tries to transcribe right away; only falls back to the offline
+// queue if that attempt actually fails.
+async function handleVoiceMemoRecorded(blob, mimeType){
+  const idea = captureIdea("🎙️ Voice memo — transcribing…");
+  if(!idea) return;
+  idea.pendingTranscription = true;
+  saveState();
+  triggerCapturePop();
+  showToast("Captured — transcribing…");
+  await transcribeVoiceMemo(idea.id, blob, mimeType);
+}
+
+function buildVoiceClassificationCatalog(){
+  const businesses = STATE.businesses.map(b => ({ id: b.id, name: b.name }));
+  const projects = STATE.projects
+    .filter(p => p.status !== "completed")
+    .map(p => ({ id: p.id, name: p.name, businessId: p.businessId }));
+  return { businesses, projects };
+}
+
+// Does the actual /api/voice/capture round-trip for one memo and applies
+// the result to the (already-created) placeholder idea. Any failure —
+// offline, flaky connection, server error — queues the audio in
+// IndexedDB instead of losing it, and leaves the idea visibly pending.
+async function transcribeVoiceMemo(ideaId, blob, mimeType){
+  const idea = ideaById(ideaId);
+  if(!idea) return; // deleted before it got a chance to transcribe
+
+  let audioBase64;
+  try{
+    audioBase64 = await blobToBase64(blob);
+  }catch(e){
+    await queueVoiceMemoOffline(idea, blob, mimeType);
+    return;
+  }
+
+  const { businesses, projects } = buildVoiceClassificationCatalog();
+  let resp;
+  try{
+    resp = await fetch("/api/voice/capture", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audioBase64, mimeType, businesses, projects }),
+    });
+  }catch(err){
+    await queueVoiceMemoOffline(idea, blob, mimeType); // genuinely offline/unreachable
+    return;
+  }
+  if(!resp.ok){
+    await queueVoiceMemoOffline(idea, blob, mimeType); // server-side error (e.g. quota) — still worth retrying later
+    return;
+  }
+  const data = await resp.json().catch(() => null);
+  applyVoiceTranscriptionResult(idea, data);
+}
+
+async function queueVoiceMemoOffline(idea, blob, mimeType){
+  const queueId = makeId("voicequeue");
+  try{
+    await voiceQueueSave(queueId, blob, mimeType);
+    idea.voiceQueueId = queueId;
+    idea.text = "🎙️ Voice memo — saved offline, will transcribe when back online";
+    saveState();
+    showToast("Saved offline — will transcribe once you're back online");
+  }catch(e){
+    // IndexedDB itself unavailable (private browsing, etc.) — nothing more
+    // to do; the idea stays as an editable placeholder rather than lost.
+    idea.text = "🎙️ Voice memo — couldn't transcribe (offline storage unavailable). Tap to edit.";
+    idea.pendingTranscription = false;
+    saveState();
+  }
+  renderApp();
+}
+
+function applyVoiceTranscriptionResult(idea, data){
+  if(!data || !data.transcript){
+    idea.text = "🎙️ Voice memo — transcription failed. Tap to edit.";
+    idea.pendingTranscription = false;
+    saveState();
+    renderApp();
+    return;
+  }
+  idea.text = data.transcript;
+  idea.pendingTranscription = false;
+  idea.voiceQueueId = null;
+  idea.updatedAt = Date.now();
+  saveState();
+
+  const CONFIDENCE_THRESHOLD = 0.6;
+  const projectMatch = data.matchType === "project" && data.matchId && data.confidence >= CONFIDENCE_THRESHOLD ? projectById(data.matchId) : null;
+  const businessMatch = data.matchType === "business" && data.matchId && data.confidence >= CONFIDENCE_THRESHOLD ? STATE.businesses.find(b => b.id === data.matchId) : null;
+
+  if(projectMatch){
+    openVoiceMatchConfirmModal(idea, "project", projectMatch.id);
+  }else if(businessMatch){
+    openVoiceMatchConfirmModal(idea, "business", businessMatch.id);
+  }else{
+    const preview = idea.text.length > 50 ? idea.text.slice(0, 47) + "…" : idea.text;
+    showToast(`💡 Transcribed: "${preview}"`);
+    renderApp();
+  }
+}
+
+function openVoiceMatchConfirmModal(idea, matchType, matchId){
+  const proj = matchType === "project" ? projectById(matchId) : null;
+  const biz = matchType === "business" ? STATE.businesses.find(b => b.id === matchId) : (proj ? STATE.businesses.find(b => b.id === proj.businessId) : null);
+  const label = proj ? proj.name : (biz ? biz.name : "this");
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">Sounds like it's for ${escapeHtml(label)} — right?</div>
+      <button class="modal-close" data-modal-close>${icon("close")}</button>
+    </div>
+    <div class="field">
+      <label class="field-label">Transcribed</label>
+      <div style="font-size:13.5px;color:var(--text-secondary);">${escapeHtml(idea.text)}</div>
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-ghost" data-modal-close>Not quite — leave in Inbox</button>
+      ${proj
+        ? `<button type="button" class="btn btn-primary" id="voiceConfirmAssignBtn">Assign to ${escapeHtml(proj.name)}</button>`
+        : `<button type="button" class="btn btn-primary" id="voiceConfirmPickBtn">Pick a project under ${escapeHtml(biz ? biz.name : "this business")}</button>`}
+    </div>
+  `, (root) => {
+    const assignBtn = root.querySelector("#voiceConfirmAssignBtn");
+    if(assignBtn) assignBtn.addEventListener("click", () => {
+      assignIdeaToProject(idea.id, proj.id);
+      closeModal();
+      showToast("Idea assigned");
+      renderApp();
+    });
+    const pickBtn = root.querySelector("#voiceConfirmPickBtn");
+    if(pickBtn) pickBtn.addEventListener("click", () => {
+      closeModal();
+      openAssignIdeaModal(idea);
+    });
+  });
+  renderApp();
+}
+
+// Retries every voice memo still sitting in IndexedDB — recorded while
+// offline, or whose first transcription attempt failed for any reason.
+// Safe to call often: each retry only re-attempts the network call, never
+// creates a duplicate idea, since the placeholder idea already exists.
+let voiceQueueFlushInFlight = false;
+async function tryFlushVoiceQueue(){
+  if(voiceQueueFlushInFlight || !navigator.onLine) return;
+  voiceQueueFlushInFlight = true;
+  try{
+    const pending = await voiceQueueAll();
+    for(const item of pending){
+      const idea = STATE.ideas.find(i => i.voiceQueueId === item.id);
+      if(!idea){
+        await voiceQueueDelete(item.id); // idea was deleted while offline — drop the orphaned audio too
+        continue;
+      }
+      await transcribeVoiceMemo(idea.id, item.blob, item.mimeType);
+      // A repeat failure re-queues under a fresh id via queueVoiceMemoOffline
+      // above, so it's always safe to clear out this original entry now.
+      await voiceQueueDelete(item.id);
+    }
+  }catch(e){ /* IndexedDB/network hiccup mid-flush — the next trigger (online event, app open, tab focus) tries again */ }
+  voiceQueueFlushInFlight = false;
+}
+window.addEventListener("online", tryFlushVoiceQueue);
+
+// Small satisfying micro-interaction on a successful capture — cheap to
+// add, and this is exactly the kind of moment the product doc asked to
+// make feel alive rather than static.
+function triggerCapturePop(){
+  const btn = document.getElementById("voiceCaptureBtn");
+  if(!btn) return;
+  btn.classList.remove("capture-pop");
+  void btn.offsetWidth; // restart the animation if it fires twice quickly
+  btn.classList.add("capture-pop");
 }
 
 /* ==========================================================================
@@ -8619,11 +8974,23 @@ function initApp(){
       handleGoogleRedirectIfPresent();
       restoreMicrosoftSession();
       initVoiceWidget(); // once only — see the function's own comment for why
+      // Previously, Drive sync only ever fired after a LOCAL edit — so an
+      // idea captured on your phone wouldn't show up on your laptop until
+      // the laptop also changed something. Syncing on open (and again on
+      // tab focus, below) closes that gap. Also catches up any voice memos
+      // still queued in IndexedDB from being offline.
+      tryFlushVoiceQueue();
+      if(STATE.integrations.google.connected) syncWithDrive({ silent: true });
     }).catch(renderFatalError);
   }catch(err){
     renderFatalError(err);
   }
 }
+document.addEventListener("visibilitychange", () => {
+  if(document.visibilityState !== "visible" || !STATE) return;
+  tryFlushVoiceQueue();
+  if(STATE.integrations.google.connected) syncWithDrive({ silent: true });
+});
 
 if(document.readyState === "loading"){
   document.addEventListener("DOMContentLoaded", initApp);
