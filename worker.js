@@ -161,6 +161,7 @@ async function handleVoiceCapture(request, env) {
 
   const businesses = Array.isArray(body.businesses) ? body.businesses : [];
   const projects = Array.isArray(body.projects) ? body.projects : [];
+  const vocabulary = Array.isArray(body.vocabulary) ? body.vocabulary.filter(Boolean) : [];
   const catalog = [
     ...businesses.map(b => `business:${b.id} — ${b.name}`),
     ...projects.map(p => `project:${p.id} — ${p.name}`),
@@ -168,7 +169,9 @@ async function handleVoiceCapture(request, env) {
 
   // Asking for transcript + classification in the same call (rather than
   // two round-trips) keeps this fast enough to feel instant on a phone.
-  const instruction = `Transcribe the attached voice memo exactly, word for word. Then, using ONLY this list of the founder's businesses and projects, decide whether the memo clearly belongs to one of them:
+  const instruction = `Transcribe the attached voice memo exactly, word for word.${vocabulary.length ? ` The speaker runs a business and uses these proper nouns often — if something sounds close to one of these, prefer it over a generic word: ${vocabulary.join(", ")}.` : ""}
+
+Then, using ONLY this list of the founder's businesses and projects, decide whether the memo clearly belongs to one of them:
 ${catalog || "(none defined yet — always respond with matchType none)"}
 
 Respond with ONLY this JSON object, no markdown fencing, no commentary:

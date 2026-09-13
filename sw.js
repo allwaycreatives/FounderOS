@@ -1,0 +1,51 @@
+/* ==========================================================================
+   Minimal service worker. Two jobs, deliberately kept small:
+   1. Its mere presence (registered + has a fetch handler) is one of the
+      technical requirements browsers check before offering "Install app" /
+      the automatic add-to-home-screen prompt — manifest.json alone isn't
+      enough in most browsers.
+   2. Lets the app shell (this HTML file + icons + manifest) still open with
+      no connection at all, not just the voice-capture offline queue inside
+      it. Falls back to cache only when the network genuinely fails.
+
+   Deliberately NOT caching /api/* — those need live data or the app's own
+   online/offline handling (see the voice queue in index.html) to do the
+   right thing; a stale cached API response would be worse than none.
+
+   Bump CACHE_NAME (e.g. v2, v3...) whenever you want to force every
+   installed copy to pick up a fresh shell instead of a stale cached one.
+   ========================================================================== */
+const CACHE_NAME = "founderos-shell-v1";
+const SHELL_FILES = ["./", "./index.html", "./manifest.json"];
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then((cache) => cache.addAll(SHELL_FILES))
+      .then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+  if (event.request.method !== "GET" || url.origin !== self.location.origin) return; // let non-GET and cross-origin requests pass straight through
+  if (url.pathname.startsWith("/api/")) return; // never cache API calls — see comment above
+
+  event.respondWith(
+    fetch(event.request)
+      .then((networkResp) => {
+        const copy = networkResp.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+        return networkResp;
+      })
+      .catch(() => caches.match(event.request).then((cached) => cached || caches.match("./index.html")))
+  );
+});

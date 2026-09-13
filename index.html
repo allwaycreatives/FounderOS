@@ -13,6 +13,13 @@
   missing manifest just means the browser never shows an install prompt.
 -->
 <link rel="manifest" href="./manifest.json" />
+<!-- iOS Safari doesn't fully honor manifest.json for icons/standalone mode even on
+     recent versions — these three tags are the reliable cross-version way to get
+     a proper home-screen icon and no browser chrome when launched from it. -->
+<link rel="apple-touch-icon" href="./icons/icon-512.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#121212" />
 <style>
 /* ==========================================================================
    SELF-HOSTED FONTS (Poppins / Inter — AWDS Section 4)
@@ -1299,6 +1306,22 @@ kbd{
   35%{ transform: scale(1.28); background: var(--amber, #ED8D01); }
   100%{ transform: scale(1); }
 }
+.quick-capture-overlay{
+  position: fixed; inset: 0; z-index: 9999;
+  background: var(--bg, #121212);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 20px; padding: 24px; text-align: center;
+}
+.quick-capture-overlay .qc-btn{
+  width: 96px; height: 96px; border-radius: 50%;
+  background: var(--amber, #ED8D01); border: none; color: #121212;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: transform 0.15s ease;
+}
+.quick-capture-overlay .qc-btn:active{ transform: scale(0.92); }
+.quick-capture-overlay .qc-btn svg{ width: 40px; height: 40px; }
+.quick-capture-overlay .qc-label{ color: var(--text-primary, #fff); font-size: 15px; font-weight: 600; }
+.quick-capture-overlay .qc-open-app{ color: var(--text-secondary, #A0A0A0); font-size: 13px; text-decoration: underline; cursor: pointer; background: none; border: none; }
 @media (max-width: 640px){
   .voice-widget{ right: 14px; bottom: 84px; } /* clears the mobile bottom nav */
   .voice-mic-btn{ width: 46px; height: 46px; }
@@ -4417,6 +4440,22 @@ function buildVoiceClassificationCatalog(){
   return { businesses, projects };
 }
 
+// Separate from the catalog above (which is filtered to active items for
+// matching purposes) — this is every proper noun Founder OS knows about,
+// used purely to help the transcription itself get names right. This is
+// exactly why "Allway" was mis-heard before: the model had no idea that
+// word was meaningful. Feel free to keep growing this list (add a
+// founder "company name" field, common client names, etc.) — more hints
+// here directly means fewer mis-transcribed names.
+function buildVoiceVocabularyHints(){
+  const names = new Set();
+  STATE.businesses.forEach(b => names.add(b.name));
+  STATE.projects.forEach(p => names.add(p.name));
+  STATE.contacts.forEach(c => names.add(c.name));
+  if(STATE.founder && STATE.founder.name) names.add(STATE.founder.name);
+  return Array.from(names).filter(Boolean);
+}
+
 // Does the actual /api/voice/capture round-trip for one memo and applies
 // the result to the (already-created) placeholder idea. Any failure —
 // offline, flaky connection, server error — queues the audio in
@@ -4434,12 +4473,13 @@ async function transcribeVoiceMemo(ideaId, blob, mimeType){
   }
 
   const { businesses, projects } = buildVoiceClassificationCatalog();
+  const vocabulary = buildVoiceVocabularyHints();
   let resp;
   try{
     resp = await fetch("/api/voice/capture", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ audioBase64, mimeType, businesses, projects }),
+      body: JSON.stringify({ audioBase64, mimeType, businesses, projects, vocabulary }),
     });
   }catch(err){
     await queueVoiceMemoOffline(idea, blob, mimeType); // genuinely offline/unreachable
@@ -4488,50 +4528,70 @@ function applyVoiceTranscriptionResult(idea, data){
   const CONFIDENCE_THRESHOLD = 0.6;
   const projectMatch = data.matchType === "project" && data.matchId && data.confidence >= CONFIDENCE_THRESHOLD ? projectById(data.matchId) : null;
   const businessMatch = data.matchType === "business" && data.matchId && data.confidence >= CONFIDENCE_THRESHOLD ? STATE.businesses.find(b => b.id === data.matchId) : null;
-
-  if(projectMatch){
-    openVoiceMatchConfirmModal(idea, "project", projectMatch.id);
-  }else if(businessMatch){
-    openVoiceMatchConfirmModal(idea, "business", businessMatch.id);
-  }else{
-    const preview = idea.text.length > 50 ? idea.text.slice(0, 47) + "…" : idea.text;
-    showToast(`💡 Transcribed: "${preview}"`);
-    renderApp();
-  }
+  openVoiceReviewModal(idea, projectMatch, businessMatch);
 }
 
-function openVoiceMatchConfirmModal(idea, matchType, matchId){
-  const proj = matchType === "project" ? projectById(matchId) : null;
-  const biz = matchType === "business" ? STATE.businesses.find(b => b.id === matchId) : (proj ? STATE.businesses.find(b => b.id === proj.businessId) : null);
-  const label = proj ? proj.name : (biz ? biz.name : "this");
+// One review step for every outcome — matched, unmatched, or failed to
+// transcribe cleanly. Replaces the old approach of a toast for
+// unmatched/low-confidence memos, which disappeared before there was
+// time to read it and left no way to see or fix what was actually
+// captured. This modal stays open until you explicitly close it, always
+// shows the transcript in an EDITABLE textarea (so a mis-heard name is a
+// one-tap fix, not a re-recording), and — when there's a confident match
+// — offers to assign it right there.
+function openVoiceReviewModal(idea, projectMatch, businessMatch){
+  const biz = businessMatch || (projectMatch ? STATE.businesses.find(b => b.id === projectMatch.businessId) : null);
+  const heading = projectMatch
+    ? `Sounds like it's for ${escapeHtml(projectMatch.name)} — right?`
+    : businessMatch
+      ? `Sounds like it's for ${escapeHtml(businessMatch.name)} — right?`
+      : "Idea captured";
+
   openModal(`
     <div class="modal-header">
-      <div class="modal-title">Sounds like it's for ${escapeHtml(label)} — right?</div>
+      <div class="modal-title">${heading}</div>
       <button class="modal-close" data-modal-close>${icon("close")}</button>
     </div>
     <div class="field">
-      <label class="field-label">Transcribed</label>
-      <div style="font-size:13.5px;color:var(--text-secondary);">${escapeHtml(idea.text)}</div>
+      <label class="field-label">Transcript — edit if it heard something wrong</label>
+      <textarea id="voiceReviewTextarea" class="field-input" rows="4" style="resize:vertical;">${escapeHtml(idea.text)}</textarea>
     </div>
     <div class="modal-footer">
-      <button type="button" class="btn btn-ghost" data-modal-close>Not quite — leave in Inbox</button>
-      ${proj
-        ? `<button type="button" class="btn btn-primary" id="voiceConfirmAssignBtn">Assign to ${escapeHtml(proj.name)}</button>`
-        : `<button type="button" class="btn btn-primary" id="voiceConfirmPickBtn">Pick a project under ${escapeHtml(biz ? biz.name : "this business")}</button>`}
+      ${projectMatch
+        ? `<button type="button" class="btn btn-ghost" data-modal-close>Leave in Inbox</button>
+           <button type="button" class="btn btn-primary" id="voiceConfirmAssignBtn">Assign to ${escapeHtml(projectMatch.name)}</button>`
+        : businessMatch
+          ? `<button type="button" class="btn btn-ghost" data-modal-close>Leave in Inbox</button>
+             <button type="button" class="btn btn-primary" id="voiceConfirmPickBtn">Pick a project under ${escapeHtml(biz ? biz.name : "this business")}</button>`
+          : `<button type="button" class="btn btn-primary" data-modal-close>Done</button>`}
     </div>
   `, (root) => {
+    const textarea = root.querySelector("#voiceReviewTextarea");
+    const saveEdit = () => {
+      const edited = textarea.value.trim();
+      if(edited && edited !== idea.text){
+        idea.text = edited;
+        idea.updatedAt = Date.now();
+        saveState();
+      }
+    };
     const assignBtn = root.querySelector("#voiceConfirmAssignBtn");
     if(assignBtn) assignBtn.addEventListener("click", () => {
-      assignIdeaToProject(idea.id, proj.id);
+      saveEdit();
+      assignIdeaToProject(idea.id, projectMatch.id);
       closeModal();
       showToast("Idea assigned");
       renderApp();
     });
     const pickBtn = root.querySelector("#voiceConfirmPickBtn");
     if(pickBtn) pickBtn.addEventListener("click", () => {
+      saveEdit();
       closeModal();
       openAssignIdeaModal(idea);
     });
+    // Also save an edit if they just close the modal without picking an
+    // assignment action — the point is the text is never lost.
+    root.querySelectorAll("[data-modal-close]").forEach(btn => btn.addEventListener("click", () => { saveEdit(); renderApp(); }));
   });
   renderApp();
 }
@@ -4571,6 +4631,48 @@ function triggerCapturePop(){
   btn.classList.remove("capture-pop");
   void btn.offsetWidth; // restart the animation if it fires twice quickly
   btn.classList.add("capture-pop");
+}
+
+// Shown only when opened via the home screen "New Idea" shortcut
+// (manifest.json shortcuts -> ?capture=1). A real tap here is what lets
+// getUserMedia's mic-permission prompt fire reliably on browsers (notably
+// Safari) that require a genuine user gesture — auto-starting recording
+// the instant the page loads doesn't reliably satisfy that everywhere.
+function maybeShowQuickCaptureOverlay(){
+  const params = new URLSearchParams(window.location.search);
+  if(params.get("capture") !== "1") return;
+  history.replaceState({}, "", window.location.pathname); // don't retrigger on refresh
+
+  const overlay = document.createElement("div");
+  overlay.className = "quick-capture-overlay";
+  overlay.innerHTML = `
+    <button class="qc-btn" id="qcRecordBtn" aria-label="Start recording">${icon("bulb")}</button>
+    <div class="qc-label" id="qcLabel">Tap to capture an idea</div>
+    <button class="qc-open-app" id="qcOpenApp">Open full app instead</button>
+  `;
+  document.body.appendChild(overlay);
+
+  const recordBtn = overlay.querySelector("#qcRecordBtn");
+  const label = overlay.querySelector("#qcLabel");
+  let recording = false;
+
+  recordBtn.addEventListener("click", async () => {
+    if(!recording){
+      if(!mediaRecorderSupported()){
+        label.textContent = "Voice capture isn't supported in this browser — opening the app instead";
+        setTimeout(() => overlay.remove(), 1200);
+        return;
+      }
+      await startVoiceMemoRecording();
+      recording = true;
+      label.textContent = "Recording… tap to finish";
+    }else{
+      stopVoiceMemoRecording();
+      label.textContent = "Got it — transcribing…";
+      setTimeout(() => overlay.remove(), 900); // hands off to the normal toast/confirm-modal flow already wired up
+    }
+  });
+  overlay.querySelector("#qcOpenApp").addEventListener("click", () => overlay.remove());
 }
 
 /* ==========================================================================
@@ -8981,6 +9083,13 @@ function initApp(){
       // still queued in IndexedDB from being offline.
       tryFlushVoiceQueue();
       if(STATE.integrations.google.connected) syncWithDrive({ silent: true });
+      // Registering this is one of the technical requirements browsers
+      // check before offering "Install app" / add-to-home-screen — see
+      // sw.js's own header comment for what it actually does day-to-day.
+      if("serviceWorker" in navigator){
+        navigator.serviceWorker.register("./sw.js").catch(() => {}); // safe no-op if it fails (e.g. unsupported browser)
+      }
+      maybeShowQuickCaptureOverlay();
     }).catch(renderFatalError);
   }catch(err){
     renderFatalError(err);
