@@ -144,17 +144,39 @@ async function handleVoiceCapture(request, env) {
     return json({ error: "audioBase64 and mimeType are required" }, 400);
   }
 
+  const mode = body.mode === "meeting" ? "meeting" : "idea";
   const businesses = Array.isArray(body.businesses) ? body.businesses : [];
   const projects = Array.isArray(body.projects) ? body.projects : [];
+  const contacts = Array.isArray(body.contacts) ? body.contacts : [];
   const vocabulary = Array.isArray(body.vocabulary) ? body.vocabulary.filter(Boolean) : [];
-  const catalog = [
-    ...businesses.map(b => `business:${b.id} — ${b.name}`),
-    ...projects.map(p => `project:${p.id} — ${p.name}`),
-  ].join("\n");
+  const vocabLine = vocabulary.length ? ` The speaker runs a business and uses these proper nouns often — if something sounds close to one of these, prefer it over a generic word: ${vocabulary.join(", ")}.` : "";
 
-  // Asking for transcript + classification in the same call (rather than
-  // two round-trips) keeps this fast enough to feel instant on a phone.
-  const instruction = `Transcribe the attached voice memo exactly, word for word.${vocabulary.length ? ` The speaker runs a business and uses these proper nouns often — if something sounds close to one of these, prefer it over a generic word: ${vocabulary.join(", ")}.` : ""}
+  let instruction;
+  if (mode === "meeting") {
+    // Structured call/meeting recap: the founder talks through what just
+    // happened on a call (WhatsApp, phone, whatever) right after hanging
+    // up, and this turns that into something actually useful to file away
+    // — not just a transcript, an actual brief.
+    const catalog = [
+      ...businesses.map(b => `business:${b.id} — ${b.name}`),
+      ...contacts.map(c => `contact:${c.id} — ${c.name}`),
+    ].join("\n");
+    instruction = `Transcribe the attached voice memo exactly, word for word.${vocabLine} This is a founder's spoken recap of a call/meeting they just finished — extract a structured brief from it.
+
+Using ONLY this list of the founder's businesses and contacts, decide whether the recap clearly names one of them:
+${catalog || "(none defined yet — always respond with matchType none)"}
+
+Respond with ONLY this JSON object, no markdown fencing, no commentary:
+{"transcript": "...", "summary": "one sentence on what the call was about", "highlights": ["key point 1", "key point 2"], "actionItems": ["thing to do 1", "thing to do 2"], "honestNotes": "the founder's candid read on how it went / how they feel about it, if they said anything like that — empty string if they didn't", "matchType": "business" | "none", "matchId": "the id after the colon above, or null", "contactMatchId": "a contact id from the list above if a specific person was named, or null", "confidence": 0.0 to 1.0}
+
+highlights and actionItems should be short bullet-style phrases pulled from what was actually said — don't invent anything not implied by the recap. Empty arrays are fine if there's genuinely nothing to list. Only set matchType/contactMatchId if clearly named; use "none"/null and confidence 0 if there's any real doubt.`;
+  } else {
+    // Idea capture + business/project classification (original behavior).
+    const catalog = [
+      ...businesses.map(b => `business:${b.id} — ${b.name}`),
+      ...projects.map(p => `project:${p.id} — ${p.name}`),
+    ].join("\n");
+    instruction = `Transcribe the attached voice memo exactly, word for word.${vocabLine}
 
 Then, using ONLY this list of the founder's businesses and projects, decide whether the memo clearly belongs to one of them:
 ${catalog || "(none defined yet — always respond with matchType none)"}
@@ -163,6 +185,7 @@ Respond with ONLY this JSON object, no markdown fencing, no commentary:
 {"transcript": "...", "matchType": "business" | "project" | "none", "matchId": "the id portion after the colon above, or null", "confidence": 0.0 to 1.0}
 
 Only choose a match if the memo clearly names or strongly, unambiguously implies that specific business or project. If there's any real doubt, use "none" and confidence 0.`;
+  }
 
   let geminiResp;
   try {
@@ -182,7 +205,7 @@ Only choose a match if the memo clearly names or strongly, unambiguously implies
               { inlineData: { mimeType: body.mimeType, data: body.audioBase64 } },
             ],
           }],
-          generationConfig: { maxOutputTokens: 800, responseMimeType: "application/json" },
+          generationConfig: { maxOutputTokens: mode === "meeting" ? 1400 : 800, responseMimeType: "application/json" },
         }),
       }
     );
@@ -209,11 +232,24 @@ Only choose a match if the memo clearly names or strongly, unambiguously implies
   } catch (e) {
     // Model didn't return clean JSON (rare, but responseMimeType isn't a
     // hard guarantee) — still surface the raw text as the transcript
-    // rather than failing the capture outright. An idea with no match is
-    // always safe to fall back to.
-    parsed = { transcript: raw.trim(), matchType: "none", matchId: null, confidence: 0 };
+    // rather than failing the capture outright. Falling back to no match
+    // is always safe.
+    parsed = { transcript: raw.trim() };
   }
 
+  if (mode === "meeting") {
+    return json({
+      transcript: parsed.transcript || "",
+      summary: parsed.summary || "",
+      highlights: Array.isArray(parsed.highlights) ? parsed.highlights.filter(Boolean) : [],
+      actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems.filter(Boolean) : [],
+      honestNotes: parsed.honestNotes || "",
+      matchType: parsed.matchType === "business" ? "business" : "none",
+      matchId: parsed.matchId || null,
+      contactMatchId: parsed.contactMatchId || null,
+      confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
+    }, 200);
+  }
   return json({
     transcript: parsed.transcript || "",
     matchType: parsed.matchType === "business" || parsed.matchType === "project" ? parsed.matchType : "none",

@@ -948,12 +948,12 @@ input[type="range"].field-input{ padding: 0; height: 6px; background: rgba(255,2
 .tab-btn svg{ width: 13px; height: 13px; vertical-align: -2px; margin-right: 2px; }
 .quick-capture-row{ display: flex; gap: 8px; margin-bottom: var(--space-4); }
 .idea-row{
-  display: flex; align-items: center; gap: var(--space-3);
+  display: flex; flex-direction: column; align-items: stretch; gap: var(--space-2);
   padding: var(--space-3) 0; border-bottom: 1px solid var(--panel-border);
 }
 .idea-row:last-child{ border-bottom: none; }
-.idea-text{ flex: 1; min-width: 0; font-size: 13.5px; }
-.idea-meta-row{ display: flex; align-items: center; gap: var(--space-2); flex-shrink: 0; }
+.idea-text{ font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.idea-meta-row{ display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
 .idea-time{ font-family: var(--font-mono); font-size: 10.5px; color: var(--text-tertiary); white-space: nowrap; }
 
 /* ==========================================================================
@@ -1356,7 +1356,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 21,
+  SCHEMA_VERSION: 23,
   APP_NAME: "Founder OS",
   APP_SUB: "Command Center",
   CURRENT_VERSION_LABEL: "v0.3 · Relationships & Notes",
@@ -1408,7 +1408,6 @@ const NAV_ITEMS = [
   { id: "projects",      label: "Projects",      icon: "folder",   built: true  },
   { id: "missions",      label: "Missions",      icon: "target",   built: true  },
   { id: "templates",     label: "Templates",     icon: "template", built: true  },
-  { id: "content",       label: "Content",       icon: "content",  built: true  },
   { id: "calendarsync",  label: "Calendar",      icon: "extcal",   built: true  },
   { id: "focus",         label: "Focus",         icon: "focus",    built: true  },
   { id: "opportunities", label: "Opportunities", icon: "pipeline", built: true  },
@@ -1457,9 +1456,6 @@ const TOUR_CONTENT = {
   ],
   templates: [
     { title: "Mission Templates", blurb: "Recurring work — a client onboarding, an edit reel, a proposal — saved once with its checklist and time estimate, so you're never rebuilding the same mission from scratch." },
-  ],
-  content: [
-    { title: "Content Pipeline", blurb: "Every piece of content moving from idea through published, per platform — so nothing sits half-finished without anyone noticing." },
   ],
   calendarsync: [
     { title: "Calendar", blurb: "Google and Microsoft calendars, live in one agenda — connect them in Settings, then create or remove events without leaving Founder OS." },
@@ -1742,24 +1738,6 @@ function OpportunityModel(overrides){
   }, overrides);
 }
 
-const CONTENT_STAGES = ["idea", "scripting", "filming", "editing", "review", "scheduled", "published"];
-const CONTENT_PLATFORMS = ["Instagram", "TikTok", "YouTube", "Facebook", "LinkedIn", "Other"];
-function ContentItemModel(overrides){
-  return Object.assign({
-    id: makeId("content"),
-    title: "Untitled Content",
-    businessId: null,
-    projectId: null, // optional link to a Project (and, through it, a Client)
-    platform: "Instagram",
-    stage: "idea", // one of CONTENT_STAGES
-    dueDate: null, // when it needs to be ready
-    publishDate: null, // when it actually/should go live
-    notes: "",
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  }, overrides);
-}
-
 // A single captured idea. Deliberately lightweight — the whole point of the
 // Idea Vault is to capture without breaking focus, so this model only ever
 // grows through a one-field quick-capture form.
@@ -1857,8 +1835,18 @@ function CommunicationModel(overrides){
 function NoteModel(overrides){
   return Object.assign({
     id: makeId("note"),
+    type: "personal", // "meeting" | "personal"
     title: "Untitled Note",
-    body: "",
+    body: "", // personal: the note itself. meeting: the raw transcript.
+    businessId: null, // meeting notes: who the call was about (optional)
+    contactId: null,  // meeting notes: who the call was WITH (optional)
+    summary: "",        // meeting only — one line on what the call was about
+    highlights: [],      // meeting only — key points, as an array of short strings
+    actionItems: [],     // meeting only — follow-ups, as an array of short strings
+    honestNotes: "",     // meeting only — candid read on how it went / how you feel about it
+    sourceTag: "",       // personal only — optional freeform label, e.g. "Atomic Habits", "Morning devotion"
+    pendingTranscription: false, // true while a voice-captured meeting recap is still being transcribed
+    voiceQueueId: null,
     pinned: false,
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -1940,12 +1928,9 @@ function defaultUiState(){
     contactFocusId: null, // drill-down: contact detail / Relationship Timeline
     notesFilter: "", // simple text filter
     notesPinnedOnly: false,
+    notesTypeFilter: "all", // all | meeting | personal
     knowledgeFilter: "",
     knowledgeFilterCategory: "all",
-    contentFilterBusinessId: "all",
-    contentFilterProjectId: "all",
-    contentViewMode: "pipeline", // pipeline | calendar
-    contentCalendarMonthOffset: 0, // 0 = current month, relative to today
   };
 }
 
@@ -1973,7 +1958,6 @@ function getDefaultState(){
     communications: [],   // logged interactions, linked to contacts
     notes: [],            // Founder Notes — quick reference, distinct from Ideas/Journal
     knowledgeArticles: defaultKnowledgeArticles(), // Knowledge Hub: SOPs, Lessons Learned, Reference docs
-    contentItems: [], // Content Pipeline: idea -> scripting -> filming -> editing -> review -> scheduled -> published
     integrations: {
       google: { clientId: "", connected: false, accountEmail: "", refreshToken: null },
       microsoft: { clientId: "", tenantId: "common", connected: false, accountEmail: "" },
@@ -2289,6 +2273,38 @@ function migrateState(state){
     state.contentItems.forEach(c => { delete c.notionPageId; });
     state.schemaVersion = 21;
   }
+  // v21 -> v22: Content Pipeline removed (that workflow now lives in
+  // BrandOS instead — duplicating a content calendar here just meant two
+  // systems arguing over the same truth).
+  if(state.schemaVersion < 22){
+    delete state.contentItems;
+    delete state.ui.contentFilterBusinessId;
+    delete state.ui.contentFilterProjectId;
+    delete state.ui.contentViewMode;
+    delete state.ui.contentCalendarMonthOffset;
+    state.schemaVersion = 22;
+  }
+  // v22 -> v23: Notes rebuilt from a plain title+body scratchpad into two
+  // real things — meeting/call recaps (structured: summary, highlights,
+  // action items, an honest read on how it went) and personal reflection
+  // notes (books, devotionals, journaling-adjacent but not tied to a
+  // business). Every existing note was the old plain kind, so it becomes
+  // "personal" — nothing is lost, just newly typed.
+  if(state.schemaVersion < 23){
+    state.notes.forEach(n => {
+      if(n.type === undefined) n.type = "personal";
+      if(n.businessId === undefined) n.businessId = null;
+      if(n.contactId === undefined) n.contactId = null;
+      if(n.summary === undefined) n.summary = "";
+      if(n.highlights === undefined) n.highlights = [];
+      if(n.actionItems === undefined) n.actionItems = [];
+      if(n.honestNotes === undefined) n.honestNotes = "";
+      if(n.sourceTag === undefined) n.sourceTag = "";
+      if(n.pendingTranscription === undefined) n.pendingTranscription = false;
+      if(n.voiceQueueId === undefined) n.voiceQueueId = null;
+    });
+    state.schemaVersion = 23;
+  }
   return state;
 }
 
@@ -2544,8 +2560,17 @@ function generateSampleData(){
   if(fintechOpp) fintechOpp.contactId = brianId;
 
   s.notes = [
-    NoteModel({ title: "Meeting recap — Promo Plays kickoff", body: "Aligned on creative direction for the playable ad pilot. Brian wants a version with sound off by default.", pinned: true }),
-    NoteModel({ title: "AWOS naming ideas", body: "Cockpit, Console, Command Deck, Bridge — \"Console\" tested best with family.", pinned: false }),
+    NoteModel({
+      type: "meeting", title: "Call with Brian — Promo Plays kickoff",
+      contactId: brianId, businessId: fintechOpp ? fintechOpp.businessId : null,
+      summary: "Aligned on creative direction for the playable ad pilot.",
+      highlights: ["Brian wants a version with sound off by default", "Timeline still targeting end of month"],
+      actionItems: ["Send updated storyboard by Friday"],
+      honestNotes: "Good energy on the call — feels like this one's actually moving.",
+      body: "Aligned on creative direction for the playable ad pilot. Brian wants a version with sound off by default.",
+      pinned: true,
+    }),
+    NoteModel({ type: "personal", title: "AWOS naming ideas", body: "Cockpit, Console, Command Deck, Bridge — \"Console\" tested best with family.", pinned: false }),
   ];
 
   s.journalEntries = [
@@ -3044,41 +3069,6 @@ function deleteOpportunity(id){
   saveState();
 }
 
-// ---- Content Pipeline ----
-function contentItemById(id){
-  return STATE.contentItems.find(c => c.id === id) || null;
-}
-function contentItemsForProject(projectId){
-  return STATE.contentItems.filter(c => c.projectId === projectId);
-}
-function createContentItem(data){
-  const item = ContentItemModel(data);
-  STATE.contentItems.push(item);
-  logActivity("info", `Added <b>${escapeHtml(item.title)}</b> to the content pipeline`);
-  saveState();
-  return item;
-}
-function updateContentItem(id, data){
-  const item = contentItemById(id);
-  if(!item) return;
-  Object.assign(item, data, { updatedAt: Date.now() });
-  saveState();
-}
-function moveContentStage(id, stage){
-  const item = contentItemById(id);
-  if(!item || !CONTENT_STAGES.includes(stage)) return;
-  item.stage = stage;
-  item.updatedAt = Date.now();
-  logActivity("info", `Moved <b>${escapeHtml(item.title)}</b> to ${stage[0].toUpperCase() + stage.slice(1)}`);
-  saveState();
-}
-function deleteContentItem(id){
-  const item = contentItemById(id);
-  if(!item) return;
-  STATE.contentItems = STATE.contentItems.filter(c => c.id !== id);
-  logActivity("info", `Removed <b>${escapeHtml(item.title)}</b> from the content pipeline`);
-  saveState();
-}
 
 /* ---- Idea Vault ----
    Deliberately minimal mutations: capture is a single field, everything
@@ -3747,7 +3737,7 @@ const DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3";
 const DRIVE_FILE_NAME = "founderos-state.json";
 const SYNC_COLLECTION_KEYS = [
   "businesses", "projects", "missions", "missionTemplates", "opportunities",
-  "contentItems", "ideas", "contacts", "communications", "notes",
+  "ideas", "contacts", "communications", "notes",
   "knowledgeArticles", "journal",
 ];
 
@@ -3910,17 +3900,6 @@ function buildAssistantContext(){
     lines.push(`Active projects: ${activeProjects.map(p => p.name).join(", ")}.`);
   }
   const now = Date.now();
-  const upcomingContent = STATE.contentItems
-    .filter(c => c.stage !== "published" && (c.dueDate || c.publishDate))
-    .sort((a, b) => (a.dueDate || a.publishDate) - (b.dueDate || b.publishDate))
-    .slice(0, 5);
-  if(upcomingContent.length){
-    lines.push(`Upcoming content:`);
-    upcomingContent.forEach(c => {
-      const d = c.dueDate || c.publishDate;
-      lines.push(`- "${c.title}" (${c.platform}, ${c.stage}, ${new Date(d).toLocaleDateString()})`);
-    });
-  }
   const overdueContacts = STATE.contacts.filter(c => c.nextFollowUpAt && c.nextFollowUpAt < now).slice(0, 5);
   if(overdueContacts.length){
     lines.push(`Contacts overdue for follow-up: ${overdueContacts.map(c => c.name).join(", ")}.`);
@@ -4545,6 +4524,128 @@ function triggerCapturePop(){
   btn.classList.remove("capture-pop");
   void btn.offsetWidth; // restart the animation if it fires twice quickly
   btn.classList.add("capture-pop");
+}
+
+/* ==========================================================================
+   SECTION: MEETING RECAP CAPTURE (Notes)
+   Deliberately separate from the idea-capture MediaRecorder flow above,
+   even though the recording mechanics are identical — reusing the same
+   button/DOM elements would mean these two very different actions (jot an
+   idea vs. debrief a call) fight over the same UI state. A little
+   duplication here buys real isolation: nothing about meeting recaps can
+   break idea capture, or vice versa.
+
+   No offline queue for this one (unlike ideas) — a deliberate scope cut.
+   Meeting recaps happen right after a call, when you almost always still
+   have signal; if a request genuinely fails, you just get told to try
+   again rather than the added complexity of a whole second offline queue.
+   ========================================================================== */
+let meetingRecapRecording = false;
+let meetingRecapRecorder = null;
+let meetingRecapChunks = [];
+let meetingRecapStream = null;
+
+async function startMeetingRecapRecording(){
+  if(meetingRecapRecording) return;
+  if(!mediaRecorderSupported()){ showToast("Voice recording isn't supported in this browser"); return; }
+  let stream;
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  }catch(err){
+    showToast("Microphone access denied or unavailable");
+    return;
+  }
+  const mimeType = pickRecorderMimeType();
+  const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+  meetingRecapStream = stream;
+  meetingRecapRecorder = recorder;
+  meetingRecapChunks = [];
+  recorder.ondataavailable = (e) => { if(e.data && e.data.size > 0) meetingRecapChunks.push(e.data); };
+  recorder.onstop = () => {
+    stream.getTracks().forEach(t => t.stop());
+    const finalMimeType = recorder.mimeType || mimeType || "audio/webm";
+    const blob = new Blob(meetingRecapChunks, { type: finalMimeType });
+    meetingRecapChunks = [];
+    handleMeetingRecapRecorded(blob, finalMimeType);
+  };
+  recorder.start();
+  meetingRecapRecording = true;
+  renderApp();
+}
+function stopMeetingRecapRecording(){
+  if(!meetingRecapRecording || !meetingRecapRecorder) return;
+  meetingRecapRecording = false;
+  try{ meetingRecapRecorder.stop(); }catch(e){}
+  renderApp();
+}
+
+async function handleMeetingRecapRecorded(blob, mimeType){
+  const note = createNote({
+    type: "meeting", title: "Meeting recap — transcribing…",
+    body: "🎙️ Transcribing…", pendingTranscription: true,
+  });
+  renderApp();
+  showToast("Captured — transcribing your recap…");
+
+  let audioBase64;
+  try{
+    audioBase64 = await blobToBase64(blob);
+  }catch(e){
+    applyMeetingRecapFailure(note, "Couldn't read the recording");
+    return;
+  }
+
+  const businesses = STATE.businesses.map(b => ({ id: b.id, name: b.name }));
+  const contacts = STATE.contacts.map(c => ({ id: c.id, name: c.name }));
+  const vocabulary = buildVoiceVocabularyHints();
+
+  let resp;
+  try{
+    resp = await fetch("/api/voice/capture", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audioBase64, mimeType, mode: "meeting", businesses, contacts, vocabulary }),
+    });
+  }catch(err){
+    applyMeetingRecapFailure(note, "No connection — try again once you're back online");
+    return;
+  }
+  if(!resp.ok){
+    applyMeetingRecapFailure(note, "Transcription failed — tap to edit and fill in manually");
+    return;
+  }
+  const data = await resp.json().catch(() => null);
+  if(!data || !data.transcript){
+    applyMeetingRecapFailure(note, "Transcription came back empty — tap to edit");
+    return;
+  }
+
+  const biz = data.matchType === "business" && data.matchId && data.confidence >= 0.6 ? businessById(data.matchId) : null;
+  const contact = data.contactMatchId ? STATE.contacts.find(c => c.id === data.contactMatchId) : null;
+  note.title = data.summary
+    ? `Call recap — ${data.summary.length > 50 ? data.summary.slice(0, 47) + "…" : data.summary}`
+    : (contact ? `Call with ${contact.name}` : "Meeting recap");
+  note.body = data.transcript;
+  note.summary = data.summary || "";
+  note.highlights = data.highlights || [];
+  note.actionItems = data.actionItems || [];
+  note.honestNotes = data.honestNotes || "";
+  note.businessId = biz ? biz.id : null;
+  note.contactId = contact ? contact.id : null;
+  note.pendingTranscription = false;
+  note.updatedAt = Date.now();
+  saveState();
+  showToast("Meeting recap saved — tap it to review or edit");
+  renderApp();
+}
+
+function applyMeetingRecapFailure(note, message){
+  note.title = "Meeting recap — needs attention";
+  note.body = message;
+  note.pendingTranscription = false;
+  saveState();
+  showToast(message);
+  renderApp();
 }
 
 // Shown only when opened via the home screen "New Idea" shortcut
@@ -6163,16 +6264,19 @@ function renderIdeaVault(){
     if(tab === "inbox"){
       actions = `
         <button class="btn btn-ghost btn-sm" data-action="assign-idea" data-id="${idea.id}">Assign to project</button>
+        <button class="icon-btn" data-action="edit-idea" data-id="${idea.id}" title="Edit">${icon("edit")}</button>
         <button class="icon-btn" data-action="archive-idea" data-id="${idea.id}" title="Archive">${icon("close")}</button>
         <button class="icon-btn" data-action="delete-idea" data-id="${idea.id}" title="Delete">${icon("trash")}</button>`;
     }else if(tab === "assigned"){
       actions = `
         <span class="tag tag-neutral">${proj ? escapeHtml(proj.name) : "Unknown project"}</span>
+        <button class="icon-btn" data-action="edit-idea" data-id="${idea.id}" title="Edit">${icon("edit")}</button>
         <button class="icon-btn" data-action="unassign-idea" data-id="${idea.id}" title="Return to inbox">${icon("close")}</button>
         <button class="icon-btn" data-action="delete-idea" data-id="${idea.id}" title="Delete">${icon("trash")}</button>`;
     }else{
       actions = `
         <button class="btn btn-ghost btn-sm" data-action="restore-idea" data-id="${idea.id}">Restore</button>
+        <button class="icon-btn" data-action="edit-idea" data-id="${idea.id}" title="Edit">${icon("edit")}</button>
         <button class="icon-btn" data-action="delete-idea" data-id="${idea.id}" title="Delete">${icon("trash")}</button>`;
     }
     return `
@@ -6228,6 +6332,38 @@ function openAssignIdeaModal(idea){
       const fd = new FormData(e.target);
       assignIdeaToProject(idea.id, fd.get("projectId"));
       showToast("Idea assigned");
+      closeModal();
+      renderApp();
+    });
+  });
+}
+
+function openEditIdeaModal(idea){
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">Edit idea</div>
+      <button class="modal-close" data-modal-close>${icon("close")}</button>
+    </div>
+    <form id="editIdeaForm">
+      <div class="field">
+        <label class="field-label">Text</label>
+        <textarea class="field-input" name="text" rows="5" style="resize:vertical;" autofocus>${escapeHtml(idea.text)}</textarea>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">Save</button>
+      </div>
+    </form>
+  `, (root) => {
+    root.querySelector("#editIdeaForm").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const text = fd.get("text").trim();
+      if(text){
+        idea.text = text;
+        idea.updatedAt = Date.now();
+        saveState();
+      }
       closeModal();
       renderApp();
     });
@@ -6313,49 +6449,88 @@ function renderJournal(){
 
 /* --------------------------------------------------------------------------
    FOUNDER NOTES
-   Quick reference material — meeting recaps, naming ideas, anything you'll
-   want to look back up. Deliberately not the Idea Vault (future
-   possibilities) and not the Journal (a daily ritual).
+   Two real things, not one junk drawer: MEETING notes are structured call/
+   meeting recaps (summary, highlights, action items, an honest read on how
+   it went) — captured either by voice right after hanging up, or typed
+   manually. PERSONAL notes are everything else worth writing down that
+   isn't tied to a business: books, devotionals, daily reflection, whatever.
+   Deliberately not the Idea Vault (future possibilities) and not the
+   Journal (a fixed daily ritual).
    -------------------------------------------------------------------------- */
 function renderNotes(){
   const filterText = STATE.ui.notesFilter.trim().toLowerCase();
   const pinnedOnly = STATE.ui.notesPinnedOnly;
+  const typeFilter = STATE.ui.notesTypeFilter || "all";
   let notes = STATE.notes.slice();
   if(pinnedOnly) notes = notes.filter(n => n.pinned);
-  if(filterText) notes = notes.filter(n => n.title.toLowerCase().includes(filterText) || n.body.toLowerCase().includes(filterText));
+  if(typeFilter !== "all") notes = notes.filter(n => n.type === typeFilter);
+  if(filterText){
+    notes = notes.filter(n =>
+      n.title.toLowerCase().includes(filterText) ||
+      n.body.toLowerCase().includes(filterText) ||
+      n.summary.toLowerCase().includes(filterText)
+    );
+  }
   notes.sort((a, b) => (b.pinned - a.pinned) || (b.updatedAt - a.updatedAt));
 
-  const cards = notes.map(n => `
+  const cards = notes.map(n => {
+    const biz = n.businessId ? businessById(n.businessId) : null;
+    const contact = n.contactId ? STATE.contacts.find(c => c.id === n.contactId) : null;
+    const isMeeting = n.type === "meeting";
+    const snippet = isMeeting
+      ? (n.summary || n.body)
+      : n.body;
+    const tags = [
+      isMeeting ? `<span class="tag tag-neutral">${icon("assistant")} Meeting</span>` : `<span class="tag tag-neutral-dim">Personal</span>`,
+      biz ? `<span class="tag tag-neutral">${escapeHtml(biz.name)}</span>` : "",
+      contact ? `<span class="tag tag-neutral">${escapeHtml(contact.name)}</span>` : "",
+      n.sourceTag ? `<span class="tag tag-neutral-dim">${escapeHtml(n.sourceTag)}</span>` : "",
+      isMeeting && n.actionItems.length ? `<span class="tag tag-time">${n.actionItems.length} action item${n.actionItems.length === 1 ? "" : "s"}</span>` : "",
+    ].filter(Boolean).join(" ");
+
+    return `
     <div class="mission-card glass card-clickable" data-action="open-note" data-id="${n.id}">
       <div class="mission-card-top">
         <div class="mission-main">
-          <div class="mission-title">${n.pinned ? `<span class="note-pin-flag">${icon("pin")}</span> ` : ""}${escapeHtml(n.title)}</div>
-          <div class="opportunity-notes" style="margin-top:6px;">${escapeHtml(n.body.length > 140 ? n.body.slice(0, 140) + "…" : n.body)}</div>
-          <div class="mission-meta" style="margin-top:8px;"><span class="tag tag-time">${timeAgo(n.updatedAt)}</span></div>
+          <div class="mission-title">${n.pinned ? `<span class="note-pin-flag">${icon("pin")}</span> ` : ""}${escapeHtml(n.pendingTranscription ? "🎙️ Transcribing meeting recap…" : n.title)}</div>
+          <div class="opportunity-notes" style="margin-top:6px;">${escapeHtml(snippet.length > 140 ? snippet.slice(0, 140) + "…" : snippet)}</div>
+          <div class="mission-meta" style="margin-top:8px;">${tags} <span class="tag tag-time">${timeAgo(n.updatedAt)}</span></div>
         </div>
         <div class="mission-card-actions">
           <button class="icon-btn" data-action="toggle-note-pin" data-id="${n.id}" title="${n.pinned ? "Unpin" : "Pin"}">${icon("pin")}</button>
           <button class="icon-btn" data-action="delete-note" data-id="${n.id}" title="Delete note">${icon("trash")}</button>
         </div>
       </div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
 
   return `
   <div class="view-enter">
     <div class="toolbar">
       <div class="toolbar-filters">
-        <input type="text" class="field-input" id="notesFilterInput" placeholder="Search notes…" value="${escapeHtml(STATE.ui.notesFilter)}" style="width:220px;" />
+        <input type="text" class="field-input" id="notesFilterInput" placeholder="Search notes…" value="${escapeHtml(STATE.ui.notesFilter)}" style="width:200px;" />
+        <select class="filter-select" data-action="filter-notes-type">
+          <option value="all" ${typeFilter === "all" ? "selected" : ""}>All notes</option>
+          <option value="meeting" ${typeFilter === "meeting" ? "selected" : ""}>Meetings</option>
+          <option value="personal" ${typeFilter === "personal" ? "selected" : ""}>Personal</option>
+        </select>
         <button class="tab-btn ${pinnedOnly ? "active" : ""}" data-action="toggle-notes-pinned-filter">${icon("pin")} Pinned only</button>
       </div>
-      <button class="btn btn-primary" data-action="new-note">${icon("plus")} New note</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn ${meetingRecapRecording ? "btn-primary" : "btn-ghost"}" id="recordMeetingRecapBtn">${icon("mic")} ${meetingRecapRecording ? "Recording… tap to finish" : "Record Meeting Recap"}</button>
+        <button class="btn btn-primary" data-action="new-note">${icon("plus")} New note</button>
+      </div>
     </div>
-    ${cards || `<div class="card glass col-12">${emptyState("note", "No notes yet", "Capture a meeting recap, a naming idea, anything worth looking back up later.")}</div>`}
+    ${cards || `<div class="card glass col-12">${emptyState("note", "No notes yet", "Record a meeting recap right after a call, or write down a personal reflection — book notes, devotion, whatever's on your mind.")}</div>`}
   </div>`;
 }
 
 function openNoteModal(note){
   const isEdit = !!note;
-  const n = note || { title: "", body: "", pinned: false };
+  const n = note || NoteModel({});
+  const bizOptions = STATE.businesses.map(b => `<option value="${b.id}" ${n.businessId === b.id ? "selected" : ""}>${escapeHtml(b.name)}</option>`).join("");
+  const contactOptions = STATE.contacts.map(c => `<option value="${c.id}" ${n.contactId === c.id ? "selected" : ""}>${escapeHtml(c.name)}</option>`).join("");
+
   openModal(`
     <div class="modal-header">
       <div class="modal-title">${isEdit ? "Edit note" : "New note"}</div>
@@ -6363,23 +6538,102 @@ function openNoteModal(note){
     </div>
     <form id="noteForm">
       <div class="field">
-        <label class="field-label">Title</label>
-        <input class="field-input" name="title" required value="${escapeHtml(n.title)}" placeholder="e.g. Meeting recap — Promo Plays kickoff" />
+        <label class="field-label">Type</label>
+        <div class="tab-group">
+          <button type="button" class="tab-btn ${n.type === "personal" ? "active" : ""}" data-note-type="personal">Personal</button>
+          <button type="button" class="tab-btn ${n.type === "meeting" ? "active" : ""}" data-note-type="meeting">Meeting recap</button>
+        </div>
+        <input type="hidden" name="type" id="noteTypeInput" value="${n.type}" />
       </div>
       <div class="field">
-        <label class="field-label">Note</label>
-        <textarea class="field-textarea" name="body" style="min-height:140px;" placeholder="What do you want to remember?">${escapeHtml(n.body)}</textarea>
+        <label class="field-label">Title</label>
+        <input class="field-input" name="title" required value="${escapeHtml(n.title)}" placeholder="${n.type === "meeting" ? "e.g. Call with Sarah — Q4 proposal" : "e.g. Notes from Atomic Habits"}" />
       </div>
+
+      <div id="noteMeetingFields" style="display:${n.type === "meeting" ? "block" : "none"};">
+        <div class="field-row">
+          <div class="field">
+            <label class="field-label">Business (optional)</label>
+            <select class="field-select" name="businessId"><option value="">—</option>${bizOptions}</select>
+          </div>
+          <div class="field">
+            <label class="field-label">Contact (optional)</label>
+            <select class="field-select" name="contactId"><option value="">—</option>${contactOptions}</select>
+          </div>
+        </div>
+        <div class="field">
+          <label class="field-label">Summary</label>
+          <input class="field-input" name="summary" value="${escapeHtml(n.summary)}" placeholder="One line on what the call was about" />
+        </div>
+        <div class="field">
+          <label class="field-label">Highlights (one per line)</label>
+          <textarea class="field-textarea" name="highlights" style="min-height:80px;">${escapeHtml(n.highlights.join("\n"))}</textarea>
+        </div>
+        <div class="field">
+          <label class="field-label">Action items (one per line)</label>
+          <textarea class="field-textarea" name="actionItems" style="min-height:80px;">${escapeHtml(n.actionItems.join("\n"))}</textarea>
+        </div>
+        <div class="field">
+          <label class="field-label">Honest read on how it went</label>
+          <textarea class="field-textarea" name="honestNotes" style="min-height:60px;" placeholder="How do you actually feel about this one?">${escapeHtml(n.honestNotes)}</textarea>
+        </div>
+        <div class="field">
+          <label class="field-label">Full transcript / notes</label>
+          <textarea class="field-textarea" name="body" style="min-height:100px;">${escapeHtml(n.body)}</textarea>
+        </div>
+      </div>
+
+      <div id="notePersonalFields" style="display:${n.type === "personal" ? "block" : "none"};">
+        <div class="field">
+          <label class="field-label">Source (optional)</label>
+          <input class="field-input" name="sourceTag" value="${escapeHtml(n.sourceTag)}" placeholder="e.g. a book title, \"Morning devotion\"" />
+        </div>
+        <div class="field">
+          <label class="field-label">Note</label>
+          <textarea class="field-textarea" name="personalBody" style="min-height:160px;" placeholder="What's on your mind?">${escapeHtml(n.body)}</textarea>
+        </div>
+      </div>
+
       <div class="modal-footer">
         <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
         <button type="submit" class="btn btn-primary">${isEdit ? "Save changes" : "Create note"}</button>
       </div>
     </form>
   `, (root) => {
+    const typeInput = root.querySelector("#noteTypeInput");
+    const meetingFields = root.querySelector("#noteMeetingFields");
+    const personalFields = root.querySelector("#notePersonalFields");
+    root.querySelectorAll("[data-note-type]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const type = btn.getAttribute("data-note-type");
+        typeInput.value = type;
+        root.querySelectorAll("[data-note-type]").forEach(b => b.classList.toggle("active", b === btn));
+        meetingFields.style.display = type === "meeting" ? "block" : "none";
+        personalFields.style.display = type === "personal" ? "block" : "none";
+      });
+    });
+
     root.querySelector("#noteForm").addEventListener("submit", (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
-      const data = { title: fd.get("title").trim() || "Untitled Note", body: fd.get("body").trim() };
+      const type = typeInput.value;
+      const splitLines = (val) => (val || "").split("\n").map(s => s.trim()).filter(Boolean);
+      const data = type === "meeting"
+        ? {
+            type, title: fd.get("title").trim() || "Untitled Note",
+            businessId: fd.get("businessId") || null,
+            contactId: fd.get("contactId") || null,
+            summary: fd.get("summary").trim(),
+            highlights: splitLines(fd.get("highlights")),
+            actionItems: splitLines(fd.get("actionItems")),
+            honestNotes: fd.get("honestNotes").trim(),
+            body: fd.get("body").trim(),
+          }
+        : {
+            type, title: fd.get("title").trim() || "Untitled Note",
+            sourceTag: fd.get("sourceTag").trim(),
+            body: fd.get("personalBody").trim(),
+          };
       if(isEdit){ updateNote(n.id, data); showToast("Note updated"); }
       else{ createNote(data); showToast("Note created"); }
       closeModal();
@@ -7017,7 +7271,6 @@ const VIEW_RENDERERS = {
   projects: renderProjects,
   missions: renderMissions,
   templates: renderTemplates,
-  content: renderContentPipeline,
   calendarsync: renderCalendarSync,
   focus: renderFocusPicker,
   opportunities: renderOpportunities,
@@ -7837,7 +8090,6 @@ function bindEvents(){
   bindPortfolioEvents();
   bindProjectEvents();
   bindTemplateEvents();
-  bindContentEvents();
   bindCalendarSyncEvents();
   bindAssistantEvents();
   bindMissionEvents();
@@ -8070,167 +8322,6 @@ function bindOpportunityEvents(){
 }
 
 /* --------------------------------------------------------------------------
-   CONTENT PIPELINE
-   Every deliverable — reel, post, video — from idea through published, per
-   platform. Distinct from Missions: a Mission is the work session that
-   produces a piece of content; a Content item is the deliverable itself and
-   where it stands with the client/platform.
-   -------------------------------------------------------------------------- */
-function renderContentPipeline(){
-  if(STATE.ui.contentViewMode === "calendar") return renderContentCalendar();
-
-  const filterBiz = STATE.ui.contentFilterBusinessId;
-  const filterProj = STATE.ui.contentFilterProjectId;
-  let items = STATE.contentItems.slice();
-  if(filterBiz !== "all") items = items.filter(c => c.businessId === filterBiz);
-  if(filterProj !== "all") items = items.filter(c => c.projectId === filterProj);
-
-  const bizOptions = STATE.businesses.map(b => `<option value="${b.id}" ${filterBiz === b.id ? "selected" : ""}>${escapeHtml(b.name)}</option>`).join("");
-  const projOptionsForFilter = (filterBiz === "all" ? STATE.projects : projectsForBusiness(filterBiz))
-    .map(p => `<option value="${p.id}" ${filterProj === p.id ? "selected" : ""}>${escapeHtml(p.name)}</option>`).join("");
-
-  const stageOptionsHtml = (selected) => CONTENT_STAGES.map(s =>
-    `<option value="${s}" ${s === selected ? "selected" : ""}>${s[0].toUpperCase() + s.slice(1)}</option>`
-  ).join("");
-
-  const sections = CONTENT_STAGES.map(stage => {
-    const inStage = items.filter(c => c.stage === stage);
-    if(!inStage.length) return "";
-    const cards = inStage.map(c => {
-      const biz = businessById(c.businessId);
-      const proj = c.projectId ? projectById(c.projectId) : null;
-      const client = proj && proj.clientContactId ? contactById(proj.clientContactId) : null;
-      const overdue = c.dueDate && c.dueDate < Date.now() && c.stage !== "published";
-      return `
-      <div class="mission-card glass">
-        <div class="mission-card-top">
-          <div class="mission-main">
-            <div class="mission-title">${escapeHtml(c.title)}</div>
-            <div class="mission-meta">
-              <span class="tag tag-biz">${biz ? escapeHtml(biz.name) : ""}</span>
-              <span class="tag tag-neutral">${escapeHtml(c.platform)}</span>
-              ${proj ? `<span class="tag tag-neutral">${escapeHtml(proj.name)}</span>` : ""}
-              ${client ? `<span class="tag tag-neutral">${icon("users")} ${escapeHtml(client.name)}</span>` : ""}
-              ${c.dueDate ? `<span class="tag" style="background:${overdue ? "var(--red-dim)" : "rgba(255,255,255,0.06)"};color:${overdue ? "var(--red)" : "var(--text-tertiary)"};">Due ${escapeHtml(relativeFutureLabel(c.dueDate))}</span>` : ""}
-            </div>
-            ${c.notes ? `<div class="opportunity-notes">${escapeHtml(c.notes)}</div>` : ""}
-          </div>
-          <div class="mission-card-actions">
-            <select class="filter-select stage-select" data-action="move-content-stage" data-id="${c.id}">${stageOptionsHtml(c.stage)}</select>
-            <button class="icon-btn" data-action="edit-content-item" data-id="${c.id}" title="Edit">${icon("edit")}</button>
-            <button class="icon-btn" data-action="delete-content-item" data-id="${c.id}" title="Delete">${icon("trash")}</button>
-          </div>
-        </div>
-      </div>`;
-    }).join("");
-    return `
-    <div class="stage-header">${stage} <span class="stage-count">${inStage.length}</span></div>
-    ${cards}`;
-  }).join("");
-
-  return `
-  <div class="view-enter">
-    <div class="toolbar">
-      <div class="toolbar-filters">
-        <button class="tab-btn active" data-action="content-view-pipeline">${icon("pipeline")} Pipeline</button>
-        <button class="tab-btn" data-action="content-view-calendar">${icon("grid")} Calendar</button>
-        <select class="filter-select" data-action="filter-content-business">
-          <option value="all">All businesses</option>
-          ${bizOptions}
-        </select>
-        <select class="filter-select" data-action="filter-content-project">
-          <option value="all">All projects</option>
-          ${projOptionsForFilter}
-        </select>
-      </div>
-      <button class="btn btn-primary" data-action="new-content-item">${icon("plus")} New content</button>
-    </div>
-    ${sections || `<div class="card glass col-12">${emptyState("content", "Nothing in the pipeline yet", "Add the first piece of content to start tracking it from idea through published.")}</div>`}
-  </div>`;
-}
-
-// Same underlying data as the Pipeline view, grouped by publish date (falling
-// back to due date if nothing's scheduled to publish yet) instead of stage —
-// answers "what's going out this month" rather than "what's stuck where".
-function renderContentCalendar(){
-  const filterBiz = STATE.ui.contentFilterBusinessId;
-  const filterProj = STATE.ui.contentFilterProjectId;
-  let items = STATE.contentItems.filter(c => c.publishDate || c.dueDate);
-  if(filterBiz !== "all") items = items.filter(c => c.businessId === filterBiz);
-  if(filterProj !== "all") items = items.filter(c => c.projectId === filterProj);
-
-  const bizOptions = STATE.businesses.map(b => `<option value="${b.id}" ${filterBiz === b.id ? "selected" : ""}>${escapeHtml(b.name)}</option>`).join("");
-  const projOptionsForFilter = (filterBiz === "all" ? STATE.projects : projectsForBusiness(filterBiz))
-    .map(p => `<option value="${p.id}" ${filterProj === p.id ? "selected" : ""}>${escapeHtml(p.name)}</option>`).join("");
-
-  const offset = STATE.ui.contentCalendarMonthOffset;
-  const today = new Date();
-  const viewDate = new Date(today.getFullYear(), today.getMonth() + offset, 1);
-  const year = viewDate.getFullYear();
-  const month = viewDate.getMonth();
-  const monthLabel = viewDate.toLocaleDateString(undefined, { month: "long", year: "numeric" });
-
-  const byDay = {};
-  items.forEach(c => {
-    const key = dateKeyFor(c.publishDate || c.dueDate);
-    (byDay[key] = byDay[key] || []).push(c);
-  });
-
-  const firstOfMonth = new Date(year, month, 1);
-  const startWeekday = firstOfMonth.getDay(); // 0 = Sunday
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const todayKey = dateKeyFor(Date.now());
-
-  let cells = "";
-  for(let i = 0; i < startWeekday; i++) cells += `<div class="cal-cell cal-cell-empty"></div>`;
-  for(let day = 1; day <= daysInMonth; day++){
-    const cellDate = new Date(year, month, day);
-    const key = dateKeyFor(cellDate.getTime());
-    const dayItems = byDay[key] || [];
-    const chips = dayItems.slice(0, 3).map(c => `
-      <div class="cal-chip" data-action="edit-content-item" data-id="${c.id}" title="${escapeHtml(c.title)} — ${escapeHtml(c.platform)}">
-        ${escapeHtml(c.title.length > 24 ? c.title.slice(0, 24) + "…" : c.title)}
-      </div>`).join("");
-    const more = dayItems.length > 3 ? `<div class="cal-chip-more">+${dayItems.length - 3} more</div>` : "";
-    cells += `
-    <div class="cal-cell ${key === todayKey ? "cal-cell-today" : ""}">
-      <div class="cal-daynum">${day}</div>
-      ${chips}${more}
-    </div>`;
-  }
-
-  return `
-  <div class="view-enter">
-    <div class="toolbar">
-      <div class="toolbar-filters">
-        <button class="tab-btn" data-action="content-view-pipeline">${icon("pipeline")} Pipeline</button>
-        <button class="tab-btn active" data-action="content-view-calendar">${icon("grid")} Calendar</button>
-        <select class="filter-select" data-action="filter-content-business">
-          <option value="all">All businesses</option>
-          ${bizOptions}
-        </select>
-        <select class="filter-select" data-action="filter-content-project">
-          <option value="all">All projects</option>
-          ${projOptionsForFilter}
-        </select>
-      </div>
-      <button class="btn btn-primary" data-action="new-content-item">${icon("plus")} New content</button>
-    </div>
-    <div class="card glass col-12">
-      <div class="cal-header">
-        <button class="icon-btn" data-action="content-cal-prev" title="Previous month">${icon("chevron")}</button>
-        <div class="cal-month-label">${monthLabel}</div>
-        <button class="icon-btn" data-action="content-cal-next" title="Next month" style="transform:scaleX(-1);">${icon("chevron")}</button>
-      </div>
-      <div class="cal-weekdays">
-        <div>Sun</div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div>
-      </div>
-      <div class="cal-grid">${cells}</div>
-    </div>
-  </div>`;
-}
-
-/* --------------------------------------------------------------------------
    CALENDAR SYNC — live agenda merged from connected Google/Microsoft
    calendars. See the CALSYNC / CALSYNC_CACHE engine above for how this
    actually talks to each provider; this section is presentation only.
@@ -8424,161 +8515,6 @@ function bindCalendarSyncEvents(){
   });
 }
 
-function openContentItemModal(item){
-  const isEdit = !!item;
-  const c = item || { title: "", businessId: STATE.businesses[0] && STATE.businesses[0].id, projectId: null, platform: "Instagram", stage: "idea", dueDate: null, publishDate: null, notes: "" };
-  openModal(`
-    <div class="modal-header">
-      <div class="modal-title">${isEdit ? "Edit content" : "New content"}</div>
-      <button class="modal-close" data-modal-close>${icon("close")}</button>
-    </div>
-    <form id="contentForm">
-      <div class="field">
-        <label class="field-label">Title</label>
-        <input class="field-input" name="title" required value="${escapeHtml(c.title)}" placeholder="e.g. Founder story reel — week 3" />
-      </div>
-      <div class="field-row">
-        <div class="field">
-          <label class="field-label">Business</label>
-          <select class="field-select" name="businessId">${businessOptionsHtml(c.businessId)}</select>
-        </div>
-        <div class="field">
-          <label class="field-label">Project (optional)</label>
-          <select class="field-select" name="projectId">
-            <option value="">None</option>
-            ${projectOptionsHtml(c.projectId)}
-          </select>
-        </div>
-      </div>
-      <div class="field-row">
-        <div class="field">
-          <label class="field-label">Platform</label>
-          <select class="field-select" name="platform">
-            ${CONTENT_PLATFORMS.map(p => `<option value="${p}" ${p === c.platform ? "selected" : ""}>${p}</option>`).join("")}
-          </select>
-        </div>
-        <div class="field">
-          <label class="field-label">Stage</label>
-          <select class="field-select" name="stage">
-            ${CONTENT_STAGES.map(s => `<option value="${s}" ${s === c.stage ? "selected" : ""}>${s[0].toUpperCase() + s.slice(1)}</option>`).join("")}
-          </select>
-        </div>
-      </div>
-      <div class="field-row">
-        <div class="field">
-          <label class="field-label">Due date (optional)</label>
-          <input class="field-input" type="date" name="dueDate" value="${c.dueDate ? new Date(c.dueDate).toISOString().slice(0, 10) : ""}" />
-        </div>
-        <div class="field">
-          <label class="field-label">Publish date (optional)</label>
-          <input class="field-input" type="date" name="publishDate" value="${c.publishDate ? new Date(c.publishDate).toISOString().slice(0, 10) : ""}" />
-        </div>
-      </div>
-      <div class="field">
-        <label class="field-label">Notes</label>
-        <textarea class="field-textarea" name="notes" placeholder="Caption ideas, feedback, anything worth remembering.">${escapeHtml(c.notes || "")}</textarea>
-      </div>
-      <div class="modal-footer">
-        <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
-        <button type="submit" class="btn btn-primary">${isEdit ? "Save changes" : "Add content"}</button>
-      </div>
-    </form>
-  `, (root) => {
-    root.querySelector("#contentForm").addEventListener("submit", (e) => {
-      e.preventDefault();
-      const fd = new FormData(e.target);
-      const dueVal = fd.get("dueDate");
-      const pubVal = fd.get("publishDate");
-      const data = {
-        title: fd.get("title").trim() || "Untitled Content",
-        businessId: fd.get("businessId"),
-        projectId: fd.get("projectId") || null,
-        platform: fd.get("platform"),
-        stage: fd.get("stage"),
-        dueDate: dueVal ? new Date(dueVal).getTime() : null,
-        publishDate: pubVal ? new Date(pubVal).getTime() : null,
-        notes: fd.get("notes").trim(),
-      };
-      if(isEdit){ updateContentItem(c.id, data); showToast("Content updated"); }
-      else{ createContentItem(data); showToast("Content added"); }
-      closeModal();
-      renderApp();
-    });
-  });
-}
-
-function bindContentEvents(){
-  const newBtn = document.querySelector('[data-action="new-content-item"]');
-  if(newBtn) newBtn.addEventListener("click", () => openContentItemModal(null));
-
-  const pipelineTab = document.querySelector('[data-action="content-view-pipeline"]');
-  if(pipelineTab){
-    pipelineTab.addEventListener("click", () => {
-      STATE.ui.contentViewMode = "pipeline";
-      saveState();
-      renderApp();
-    });
-  }
-  const calendarTab = document.querySelector('[data-action="content-view-calendar"]');
-  if(calendarTab){
-    calendarTab.addEventListener("click", () => {
-      STATE.ui.contentViewMode = "calendar";
-      saveState();
-      renderApp();
-    });
-  }
-  const calPrev = document.querySelector('[data-action="content-cal-prev"]');
-  if(calPrev){
-    calPrev.addEventListener("click", () => {
-      STATE.ui.contentCalendarMonthOffset -= 1;
-      saveState();
-      renderApp();
-    });
-  }
-  const calNext = document.querySelector('[data-action="content-cal-next"]');
-  if(calNext){
-    calNext.addEventListener("click", () => {
-      STATE.ui.contentCalendarMonthOffset += 1;
-      saveState();
-      renderApp();
-    });
-  }
-
-  document.querySelectorAll('[data-action="edit-content-item"]').forEach(btn => {
-    btn.addEventListener("click", () => openContentItemModal(contentItemById(btn.getAttribute("data-id"))));
-  });
-  document.querySelectorAll('[data-action="delete-content-item"]').forEach(btn => {
-    btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-id");
-      const item = contentItemById(id);
-      confirmAndDelete(`Delete "${item.title}"?`, () => deleteContentItem(id));
-    });
-  });
-  document.querySelectorAll('[data-action="move-content-stage"]').forEach(sel => {
-    sel.addEventListener("change", () => {
-      moveContentStage(sel.getAttribute("data-id"), sel.value);
-      renderApp();
-    });
-  });
-  const bizFilter = document.querySelector('[data-action="filter-content-business"]');
-  if(bizFilter){
-    bizFilter.addEventListener("change", () => {
-      STATE.ui.contentFilterBusinessId = bizFilter.value;
-      STATE.ui.contentFilterProjectId = "all";
-      saveState();
-      renderApp();
-    });
-  }
-  const projFilter = document.querySelector('[data-action="filter-content-project"]');
-  if(projFilter){
-    projFilter.addEventListener("change", () => {
-      STATE.ui.contentFilterProjectId = projFilter.value;
-      saveState();
-      renderApp();
-    });
-  }
-}
-
 /* ---- Idea Vault bindings ---- */
 function bindIdeaVaultEvents(){
   document.querySelectorAll('[data-action="idea-tab"]').forEach(btn => {
@@ -8604,6 +8540,9 @@ function bindIdeaVaultEvents(){
 
   document.querySelectorAll('[data-action="assign-idea"]').forEach(btn => {
     btn.addEventListener("click", () => openAssignIdeaModal(ideaById(btn.getAttribute("data-id"))));
+  });
+  document.querySelectorAll('[data-action="edit-idea"]').forEach(btn => {
+    btn.addEventListener("click", () => openEditIdeaModal(ideaById(btn.getAttribute("data-id"))));
   });
   document.querySelectorAll('[data-action="unassign-idea"]').forEach(btn => {
     btn.addEventListener("click", () => { unassignIdea(btn.getAttribute("data-id")); renderApp(); });
@@ -8772,6 +8711,21 @@ function bindNotesEvents(){
       STATE.ui.notesPinnedOnly = !STATE.ui.notesPinnedOnly;
       saveState();
       renderApp();
+    });
+  }
+  const typeFilterSelect = document.querySelector('[data-action="filter-notes-type"]');
+  if(typeFilterSelect){
+    typeFilterSelect.addEventListener("change", () => {
+      STATE.ui.notesTypeFilter = typeFilterSelect.value;
+      saveState();
+      renderApp();
+    });
+  }
+  const recordMeetingBtn = document.getElementById("recordMeetingRecapBtn");
+  if(recordMeetingBtn){
+    recordMeetingBtn.addEventListener("click", () => {
+      if(meetingRecapRecording) stopMeetingRecapRecording();
+      else startMeetingRecapRecording();
     });
   }
 }
