@@ -23,6 +23,9 @@ export default {
     if (url.pathname === "/api/voice/capture") {
       return handleVoiceCapture(request, env);
     }
+    if (url.pathname === "/api/idea/analyze") {
+      return handleIdeaAnalyze(request, env);
+    }
 
     // Anything else: behave exactly like the old assets-only deployment.
     return env.ASSETS.fetch(request);
@@ -181,8 +184,10 @@ highlights and actionItems should be short bullet-style phrases pulled from what
 Then, using ONLY this list of the founder's businesses and projects, decide whether the memo clearly belongs to one of them:
 ${catalog || "(none defined yet — always respond with matchType none)"}
 
+Also produce a one-line summary of what the idea actually is, and a short, punchy, actionable title suitable for a task-tracking "Mission" the founder would create when they're ready to act on this idea (imperative, concrete — e.g. "Pitch the loyalty-app concept to two clients", not "Loyalty app idea").
+
 Respond with ONLY this JSON object, no markdown fencing, no commentary:
-{"transcript": "...", "matchType": "business" | "project" | "none", "matchId": "the id portion after the colon above, or null", "confidence": 0.0 to 1.0}
+{"transcript": "...", "summary": "one line on what this idea is", "suggestedMissionTitle": "a short actionable mission title", "matchType": "business" | "project" | "none", "matchId": "the id portion after the colon above, or null", "confidence": 0.0 to 1.0}
 
 Only choose a match if the memo clearly names or strongly, unambiguously implies that specific business or project. If there's any real doubt, use "none" and confidence 0.`;
   }
@@ -205,7 +210,7 @@ Only choose a match if the memo clearly names or strongly, unambiguously implies
               { inlineData: { mimeType: body.mimeType, data: body.audioBase64 } },
             ],
           }],
-          generationConfig: { maxOutputTokens: mode === "meeting" ? 1400 : 800, responseMimeType: "application/json" },
+          generationConfig: { maxOutputTokens: mode === "meeting" ? 1400 : 1000, responseMimeType: "application/json" },
         }),
       }
     );
@@ -252,6 +257,8 @@ Only choose a match if the memo clearly names or strongly, unambiguously implies
   }
   return json({
     transcript: parsed.transcript || "",
+    summary: parsed.summary || "",
+    suggestedMissionTitle: parsed.suggestedMissionTitle || "",
     matchType: parsed.matchType === "business" || parsed.matchType === "project" ? parsed.matchType : "none",
     matchId: parsed.matchId || null,
     confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
@@ -259,7 +266,96 @@ Only choose a match if the memo clearly names or strongly, unambiguously implies
 }
 
 /**
- * In-app Claude assistant. Same reasoning as the Google proxy above —
+ * Text-only sibling of handleVoiceCapture's "idea" mode — for ideas typed
+ * manually (quick-capture modal, or edited after the fact) rather than
+ * spoken. Same classification + summary + mission-title generation, minus
+ * the audio transcription step since there's no audio to transcribe.
+ */
+async function handleIdeaAnalyze(request, env) {
+  if (request.method !== "POST") return json({ error: "POST only" }, 405);
+  if (!env.GEMINI_API_KEY) {
+    return json(
+      { error: "GEMINI_API_KEY is not configured on this Worker. Set it in Cloudflare dashboard > Settings > Variables and Secrets." },
+      500
+    );
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+  const text = (body.text || "").trim();
+  if (!text) return json({ error: "text is required" }, 400);
+
+  const businesses = Array.isArray(body.businesses) ? body.businesses : [];
+  const projects = Array.isArray(body.projects) ? body.projects : [];
+  const catalog = [
+    ...businesses.map(b => `business:${b.id} — ${b.name}`),
+    ...projects.map(p => `project:${p.id} — ${p.name}`),
+  ].join("\n");
+
+  const instruction = `Here is an idea a founder jotted down: "${text}"
+
+Using ONLY this list of the founder's businesses and projects, decide whether the idea clearly belongs to one of them:
+${catalog || "(none defined yet — always respond with matchType none)"}
+
+Also produce a one-line summary of what the idea actually is, and a short, punchy, actionable title suitable for a task-tracking "Mission" the founder would create when they're ready to act on this idea (imperative, concrete — e.g. "Pitch the loyalty-app concept to two clients", not "Loyalty app idea").
+
+Respond with ONLY this JSON object, no markdown fencing, no commentary:
+{"summary": "one line on what this idea is", "suggestedMissionTitle": "a short actionable mission title", "matchType": "business" | "project" | "none", "matchId": "the id portion after the colon above, or null", "confidence": 0.0 to 1.0}
+
+Only choose a match if the idea clearly names or strongly, unambiguously implies that specific business or project. If there's any real doubt, use "none" and confidence 0.`;
+
+  let geminiResp;
+  try {
+    geminiResp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": env.GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: instruction }] }],
+          generationConfig: { maxOutputTokens: 500, responseMimeType: "application/json" },
+        }),
+      }
+    );
+  } catch (err) {
+    return json({ error: `Couldn't reach Gemini: ${err.message || err}` }, 502);
+  }
+
+  const data = await geminiResp.json().catch(() => null);
+  if (!geminiResp.ok || !data) {
+    return json(
+      { error: (data && data.error && data.error.message) || `Gemini request failed (${geminiResp.status})` },
+      geminiResp.status || 502
+    );
+  }
+
+  const candidate = data.candidates && data.candidates[0];
+  const raw = candidate && candidate.content && candidate.content.parts
+    ? candidate.content.parts.map(p => p.text || "").join("")
+    : "";
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    parsed = {};
+  }
+
+  return json({
+    summary: parsed.summary || "",
+    suggestedMissionTitle: parsed.suggestedMissionTitle || "",
+    matchType: parsed.matchType === "business" || parsed.matchType === "project" ? parsed.matchType : "none",
+    matchId: parsed.matchId || null,
+    confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
+  }, 200);
+}
  * ANTHROPIC_API_KEY is a Worker secret, never sent to the browser. This is
  * the founder's OWN Anthropic Console account and billing, separate from
  * (and unrelated to) whatever Claude product built this app.

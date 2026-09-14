@@ -953,6 +953,8 @@ input[type="range"].field-input{ padding: 0; height: 6px; background: rgba(255,2
 }
 .idea-row:last-child{ border-bottom: none; }
 .idea-text{ font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.idea-summary{ font-size: 12.5px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px; }
+.idea-summary svg{ width: 13px; height: 13px; flex-shrink: 0; }
 .idea-meta-row{ display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
 .idea-time{ font-family: var(--font-mono); font-size: 10.5px; color: var(--text-tertiary); white-space: nowrap; }
 
@@ -1356,7 +1358,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 23,
+  SCHEMA_VERSION: 24,
   APP_NAME: "Founder OS",
   APP_SUB: "Command Center",
   CURRENT_VERSION_LABEL: "v0.3 · Relationships & Notes",
@@ -1747,6 +1749,10 @@ function IdeaModel(overrides){
     text: "",
     status: "inbox", // inbox | assigned | archived
     projectId: null,
+    // AI-generated, filled in after transcription/analysis — never
+    // required, always editable, never blocks capture if generation fails.
+    summary: "", // one-line "what this idea actually is"
+    suggestedMissionTitle: "", // pre-fills the mission title when you're ready to act on it
     // Voice-capture-only fields. pendingTranscription: true means this
     // idea is a placeholder for an offline voice memo whose audio hasn't
     // been transcribed yet — voiceQueueId points at the blob sitting in
@@ -2304,6 +2310,16 @@ function migrateState(state){
       if(n.voiceQueueId === undefined) n.voiceQueueId = null;
     });
     state.schemaVersion = 23;
+  }
+  // v23 -> v24: ideas gained AI-generated summary + suggested mission
+  // title fields (see the Gemini idea analysis pass). Existing ideas
+  // simply don't have these yet until re-analyzed — empty is a safe default.
+  if(state.schemaVersion < 24){
+    state.ideas.forEach(i => {
+      if(i.summary === undefined) i.summary = "";
+      if(i.suggestedMissionTitle === undefined) i.suggestedMissionTitle = "";
+    });
+    state.schemaVersion = 24;
   }
   return state;
 }
@@ -4413,6 +4429,8 @@ function applyVoiceTranscriptionResult(idea, data){
     return;
   }
   idea.text = data.transcript;
+  idea.summary = data.summary || "";
+  idea.suggestedMissionTitle = data.suggestedMissionTitle || "";
   idea.pendingTranscription = false;
   idea.voiceQueueId = null;
   idea.updatedAt = Date.now();
@@ -4430,8 +4448,9 @@ function applyVoiceTranscriptionResult(idea, data){
 // time to read it and left no way to see or fix what was actually
 // captured. This modal stays open until you explicitly close it, always
 // shows the transcript in an EDITABLE textarea (so a mis-heard name is a
-// one-tap fix, not a re-recording), and — when there's a confident match
-// — offers to assign it right there.
+// one-tap fix, not a re-recording), shows the AI-generated summary and
+// suggested mission title when available, and — when there's a confident
+// business/project match — offers to assign it right there.
 function openVoiceReviewModal(idea, projectMatch, businessMatch){
   const biz = businessMatch || (projectMatch ? STATE.businesses.find(b => b.id === projectMatch.businessId) : null);
   const heading = projectMatch
@@ -4449,6 +4468,12 @@ function openVoiceReviewModal(idea, projectMatch, businessMatch){
       <label class="field-label">Transcript — edit if it heard something wrong</label>
       <textarea id="voiceReviewTextarea" class="field-input" rows="4" style="resize:vertical;">${escapeHtml(idea.text)}</textarea>
     </div>
+    ${idea.summary ? `<div class="field"><label class="field-label">Summary</label><div style="font-size:13.5px;color:var(--text-secondary);">${escapeHtml(idea.summary)}</div></div>` : ""}
+    ${idea.suggestedMissionTitle ? `
+    <div class="field">
+      <label class="field-label">When you're ready to work on this</label>
+      <button type="button" class="btn btn-ghost btn-sm" id="voiceCreateMissionBtn">${icon("target")} Create mission: "${escapeHtml(idea.suggestedMissionTitle)}"</button>
+    </div>` : ""}
     <div class="modal-footer">
       ${projectMatch
         ? `<button type="button" class="btn btn-ghost" data-modal-close>Leave in Inbox</button>
@@ -4482,11 +4507,31 @@ function openVoiceReviewModal(idea, projectMatch, businessMatch){
       closeModal();
       openAssignIdeaModal(idea);
     });
+    const createMissionBtn = root.querySelector("#voiceCreateMissionBtn");
+    if(createMissionBtn) createMissionBtn.addEventListener("click", () => {
+      saveEdit();
+      closeModal();
+      turnIdeaIntoMission(idea);
+    });
     // Also save an edit if they just close the modal without picking an
     // assignment action — the point is the text is never lost.
     root.querySelectorAll("[data-modal-close]").forEach(btn => btn.addEventListener("click", () => { saveEdit(); renderApp(); }));
   });
   renderApp();
+}
+
+// Shared by both the voice-review modal and the Idea Vault list's own
+// "Create Mission" button. Opens the normal mission modal pre-filled with
+// the AI suggestion (or the idea text itself if there's no suggestion
+// yet), and archives the idea once the mission is actually created so it
+// doesn't linger duplicated in the Inbox.
+function turnIdeaIntoMission(idea){
+  const presetTitle = idea.suggestedMissionTitle || idea.text;
+  openMissionModal(null, idea.projectId || undefined, presetTitle, () => {
+    archiveIdea(idea.id);
+    showToast("Idea turned into a mission");
+    renderApp();
+  });
 }
 
 // Retries every voice memo still sitting in IndexedDB — recorded while
@@ -5537,10 +5582,10 @@ function openProjectModal(project, presetBusinessId, presetClientContactId){
   });
 }
 
-function openMissionModal(mission, presetProjectId){
+function openMissionModal(mission, presetProjectId, presetTitle, onCreated){
   const isEdit = !!mission;
   const m = mission || {
-    title: "", projectId: presetProjectId || (STATE.projects[0] && STATE.projects[0].id),
+    title: presetTitle || "", projectId: presetProjectId || (STATE.projects[0] && STATE.projects[0].id),
     priority: "medium", estimatedMinutes: 60, impactScore: 5, status: "active",
   };
   openModal(`
@@ -5610,7 +5655,11 @@ function openMissionModal(mission, presetProjectId){
         impactScore: Number(fd.get("impactScore")) || 5,
       };
       if(isEdit){ updateMission(m.id, data); showToast("Mission updated"); }
-      else{ createMission(data); showToast("Mission created"); }
+      else{
+        const created = createMission(data);
+        showToast("Mission created");
+        if(typeof onCreated === "function") onCreated(created);
+      }
       closeModal();
       renderApp();
     });
@@ -6260,16 +6309,21 @@ function renderIdeaVault(){
 
   const rows = ideas.map(idea => {
     const proj = idea.projectId ? projectById(idea.projectId) : null;
+    const missionBtn = idea.status !== "archived"
+      ? `<button class="icon-btn" data-action="create-mission-from-idea" data-id="${idea.id}" title="Create mission">${icon("target")}</button>`
+      : "";
     let actions = "";
     if(tab === "inbox"){
       actions = `
         <button class="btn btn-ghost btn-sm" data-action="assign-idea" data-id="${idea.id}">Assign to project</button>
+        ${missionBtn}
         <button class="icon-btn" data-action="edit-idea" data-id="${idea.id}" title="Edit">${icon("edit")}</button>
         <button class="icon-btn" data-action="archive-idea" data-id="${idea.id}" title="Archive">${icon("close")}</button>
         <button class="icon-btn" data-action="delete-idea" data-id="${idea.id}" title="Delete">${icon("trash")}</button>`;
     }else if(tab === "assigned"){
       actions = `
         <span class="tag tag-neutral">${proj ? escapeHtml(proj.name) : "Unknown project"}</span>
+        ${missionBtn}
         <button class="icon-btn" data-action="edit-idea" data-id="${idea.id}" title="Edit">${icon("edit")}</button>
         <button class="icon-btn" data-action="unassign-idea" data-id="${idea.id}" title="Return to inbox">${icon("close")}</button>
         <button class="icon-btn" data-action="delete-idea" data-id="${idea.id}" title="Delete">${icon("trash")}</button>`;
@@ -6282,6 +6336,7 @@ function renderIdeaVault(){
     return `
     <div class="idea-row">
       <div class="idea-text">${escapeHtml(idea.text)}</div>
+      ${idea.summary ? `<div class="idea-summary">${icon("bulb")} ${escapeHtml(idea.summary)}</div>` : ""}
       <div class="idea-meta-row">
         <span class="idea-time">${timeAgo(idea.createdAt)}</span>
         ${actions}
@@ -6359,12 +6414,14 @@ function openEditIdeaModal(idea){
       e.preventDefault();
       const fd = new FormData(e.target);
       const text = fd.get("text").trim();
+      const textChanged = text && text !== idea.text;
       if(text){
         idea.text = text;
         idea.updatedAt = Date.now();
         saveState();
       }
       closeModal();
+      if(textChanged) analyzeIdeaText(idea); // re-generate the summary/mission suggestion since the underlying idea changed
       renderApp();
     });
   });
@@ -6394,10 +6451,50 @@ function openIdeaQuickCaptureModal(){
       const fd = new FormData(e.target);
       const idea = captureIdea(fd.get("text"));
       closeModal();
-      if(idea) showToast("Idea captured");
+      if(idea){
+        showToast("Idea captured");
+        analyzeIdeaText(idea); // fire-and-forget — fills in summary/mission title/classification a moment later
+      }
       renderApp();
     });
   });
+}
+
+// Text-only sibling of the voice-capture analysis, for ideas typed rather
+// than spoken (quick-capture, or after editing). Fire-and-forget by
+// design — capture/editing already succeeded and saved by the time this
+// runs, so a failure here just means the idea stays without a summary/
+// suggestion rather than blocking anything the founder is doing.
+async function analyzeIdeaText(idea){
+  if(!idea || !idea.text || !idea.text.trim()) return;
+  const businesses = STATE.businesses.map(b => ({ id: b.id, name: b.name }));
+  const projects = STATE.projects.filter(p => p.status !== "completed").map(p => ({ id: p.id, name: p.name, businessId: p.businessId }));
+  let resp;
+  try{
+    resp = await fetch("/api/idea/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: idea.text, businesses, projects }),
+    });
+  }catch(err){ return; } // offline/unreachable — idea just stays without a summary, no error surfaced for a background enhancement
+  if(!resp.ok) return;
+  const data = await resp.json().catch(() => null);
+  if(!data) return;
+
+  const stillExists = ideaById(idea.id);
+  if(!stillExists) return; // deleted while this was in flight
+
+  idea.summary = data.summary || "";
+  idea.suggestedMissionTitle = data.suggestedMissionTitle || "";
+  saveState();
+  // Unlike voice capture, deliberately no confirm-modal interruption here
+  // — the founder is mid-flow doing something else (that's WHY they typed
+  // a quick idea instead of stopping to record). The summary and mission
+  // suggestion just quietly appear next time they look at the Idea Vault,
+  // via the same "Create Mission" button used everywhere else. A found
+  // business/project match still isn't auto-assigned without confirmation
+  // — same principle as voice capture, just surfaced passively instead.
+  renderApp();
 }
 
 /* --------------------------------------------------------------------------
@@ -8543,6 +8640,9 @@ function bindIdeaVaultEvents(){
   });
   document.querySelectorAll('[data-action="edit-idea"]').forEach(btn => {
     btn.addEventListener("click", () => openEditIdeaModal(ideaById(btn.getAttribute("data-id"))));
+  });
+  document.querySelectorAll('[data-action="create-mission-from-idea"]').forEach(btn => {
+    btn.addEventListener("click", () => turnIdeaIntoMission(ideaById(btn.getAttribute("data-id"))));
   });
   document.querySelectorAll('[data-action="unassign-idea"]').forEach(btn => {
     btn.addEventListener("click", () => { unassignIdea(btn.getAttribute("data-id")); renderApp(); });
