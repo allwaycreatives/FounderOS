@@ -1360,6 +1360,10 @@ const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
   SCHEMA_VERSION: 24,
   APP_NAME: "Founder OS",
+  // Matches VAPID_PUBLIC_KEY in worker.js exactly — this half isn't
+  // secret (only the private key, held server-side, needs to be), so
+  // it's fine hardcoded here too.
+  VAPID_PUBLIC_KEY: "BPdVV5aL9adUNkAQzoX6c0WL7IZrfNA0mi2d2aHLbRi9dUXFTYryl6B9Lxz5OD9zTXisdI50vV2CJReijm0xXTA",
   APP_SUB: "Command Center",
   CURRENT_VERSION_LABEL: "v0.3 · Relationships & Notes",
   FOCUS_DAILY_TARGET_MINUTES: 120, // deep-work minutes/day that count as a "full" Focus score
@@ -4736,6 +4740,133 @@ function maybeShowQuickCaptureOverlay(){
 }
 
 /* ==========================================================================
+   SECTION: PUSH NOTIFICATIONS
+   Real server-sent push (see worker.js + PUSH_KV), not just in-page
+   reminders — these fire even if the app hasn't been opened in hours,
+   which is the whole point for a focus/break session running in the
+   background. deviceId is deliberately NOT part of STATE/Drive sync: it
+   identifies THIS browser's push subscription, which is meaningless on
+   any other device.
+   ========================================================================== */
+function getDeviceId(){
+  let id = localStorage.getItem("founderos.deviceId");
+  if(!id){
+    id = (crypto.randomUUID ? crypto.randomUUID() : makeId("device"));
+    localStorage.setItem("founderos.deviceId", id);
+  }
+  return id;
+}
+function urlBase64ToUint8Array(base64String){
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for(let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+function pushNotificationsSupported(){
+  return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+function pushSubscriptionActive(){
+  return !!localStorage.getItem("founderos.pushSubscribed");
+}
+
+async function enablePushNotifications(){
+  if(!pushNotificationsSupported()){
+    showToast("Push notifications aren't supported in this browser");
+    return false;
+  }
+  const permission = await Notification.requestPermission();
+  if(permission !== "granted"){
+    showToast("Notification permission was denied");
+    return false;
+  }
+  try{
+    const registration = await navigator.serviceWorker.ready;
+    let subscription = await registration.pushManager.getSubscription();
+    if(!subscription){
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(CONFIG.VAPID_PUBLIC_KEY),
+      });
+    }
+    const resp = await fetch("/api/push/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId: getDeviceId(), subscription: subscription.toJSON() }),
+    });
+    if(!resp.ok) throw new Error(`Server rejected subscription (${resp.status})`);
+    localStorage.setItem("founderos.pushSubscribed", "1");
+    showToast("Push notifications enabled on this device");
+    return true;
+  }catch(err){
+    showToast(`Couldn't enable push notifications: ${err.message || err}`);
+    return false;
+  }
+}
+
+async function disablePushNotifications(){
+  try{
+    const registration = await navigator.serviceWorker.ready;
+    const subscription = await registration.pushManager.getSubscription();
+    if(subscription) await subscription.unsubscribe();
+  }catch(e){ /* best effort — proceed to tell the server regardless */ }
+  try{
+    await fetch("/api/push/unsubscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId: getDeviceId() }),
+    });
+  }catch(e){ /* offline — the local unsubscribe above still stops notifications on this device */ }
+  localStorage.removeItem("founderos.pushSubscribed");
+  showToast("Push notifications turned off on this device");
+}
+
+async function sendTestPushNotification(){
+  try{
+    const resp = await fetch("/api/push/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId: getDeviceId() }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if(!resp.ok) throw new Error(data.error || `Failed (${resp.status})`);
+    showToast("Test sent — it should arrive any second");
+  }catch(err){
+    showToast(`Test failed: ${err.message || err}`);
+  }
+}
+
+// Schedules a real server-side push for a future time (e.g. a focus
+// session check-in). Returns the reminder's id so the caller can cancel it
+// later via cancelPushReminder if the session ends early. Fails silently
+// (returns null) if push isn't enabled — callers should treat reminders as
+// a bonus, never a requirement for the feature they're attached to.
+async function schedulePushReminder({ dueAt, title, body, tag, url }){
+  if(!pushSubscriptionActive()) return null;
+  try{
+    const resp = await fetch("/api/push/schedule", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId: getDeviceId(), dueAt, title, body, tag, url }),
+    });
+    if(!resp.ok) return null;
+    const data = await resp.json().catch(() => null);
+    return data && data.id ? data.id : null;
+  }catch(e){ return null; }
+}
+async function cancelPushReminder(id){
+  if(!id) return;
+  try{
+    await fetch("/api/push/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+  }catch(e){ /* not worth surfacing — worst case an already-cancelled session still gets one stray reminder */ }
+}
+
+/* ==========================================================================
    SECTION: MODAL SYSTEM
    A single reusable modal mount point. Callers supply inner HTML and an
    onMount callback to wire up form submission — this keeps every
@@ -7341,6 +7472,25 @@ function renderSettings(){
       </div>
 
       <div class="card glass col-12">
+        <h3 class="card-title"><span class="card-icon">${icon("bell")}</span>Push Notifications</h3>
+        <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);">
+          Real notifications sent from the server — these arrive even if this device hasn't had Founder OS open in hours. Per-device: enabling this on your phone doesn't enable it on your laptop, and vice versa. Used for focus/break session reminders and check-ins.
+        </div>
+        <div class="settings-section">
+          <div class="settings-row">
+            <div>
+              <div class="settings-row-label">This device</div>
+              <div class="settings-row-desc">${pushSubscriptionActive() ? "Notifications enabled" : "Not enabled on this device yet"}</div>
+            </div>
+            <div style="display:flex;gap:8px;">
+              ${pushSubscriptionActive() ? `<button class="btn btn-ghost btn-sm" data-action="send-test-push">Send test</button>` : ""}
+              <button class="btn ${pushSubscriptionActive() ? "btn-ghost" : "btn-primary"} btn-sm" data-action="${pushSubscriptionActive() ? "disable-push" : "enable-push"}">${pushSubscriptionActive() ? "Disable" : "Enable"}</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card glass col-12">
         <h3 class="card-title" style="color: var(--red)">Danger Zone</h3>
         <div class="danger-zone" style="display:flex; align-items:center; justify-content:space-between; gap: var(--space-4); flex-wrap: wrap;">
           <div>
@@ -8165,6 +8315,13 @@ function bindEvents(){
   }
   const disconnectMsBtn = document.querySelector('[data-action="disconnect-microsoft"]');
   if(disconnectMsBtn) disconnectMsBtn.addEventListener("click", disconnectMicrosoftCalendar);
+
+  const enablePushBtn = document.querySelector('[data-action="enable-push"]');
+  if(enablePushBtn) enablePushBtn.addEventListener("click", async () => { await enablePushNotifications(); renderApp(); });
+  const disablePushBtn = document.querySelector('[data-action="disable-push"]');
+  if(disablePushBtn) disablePushBtn.addEventListener("click", async () => { await disablePushNotifications(); renderApp(); });
+  const testPushBtn = document.querySelector('[data-action="send-test-push"]');
+  if(testPushBtn) testPushBtn.addEventListener("click", sendTestPushNotification);
 
   const syncDriveBtn = document.querySelector('[data-action="sync-drive-now"]');
   if(syncDriveBtn){

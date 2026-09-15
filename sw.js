@@ -49,3 +49,38 @@ self.addEventListener("fetch", (event) => {
       .catch(() => caches.match(event.request).then((cached) => cached || caches.match("./index.html")))
   );
 });
+
+/* --------------------------------------------------------------------------
+   PUSH NOTIFICATIONS (focus/break session reminders)
+   The Worker (see worker.js) sends an encrypted push message; this is what
+   actually turns it into something the person sees. `tag` lets a newer
+   reminder replace an older still-showing one (e.g. session status
+   updates) instead of piling up notifications.
+   -------------------------------------------------------------------------- */
+self.addEventListener("push", (event) => {
+  let data = { title: "Founder OS", body: "", url: "./" };
+  try{ if(event.data) data = Object.assign(data, event.data.json()); }catch(e){ /* malformed payload — fall back to the generic default above */ }
+
+  event.waitUntil(
+    self.registration.showNotification(data.title, {
+      body: data.body,
+      icon: "./icons/icon-192.png",
+      badge: "./icons/icon-192.png",
+      tag: data.tag || undefined,
+      data: { url: data.url || "./" },
+    })
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const targetUrl = (event.notification.data && event.notification.data.url) || "./";
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
+      for (const client of clientList) {
+        if ("focus" in client) return client.focus(); // reuse an already-open tab/window rather than opening a new one
+      }
+      if (self.clients.openWindow) return self.clients.openWindow(targetUrl);
+    })
+  );
+});
