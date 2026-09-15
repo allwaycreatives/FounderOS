@@ -434,7 +434,7 @@ async function handleVoiceCapture(request, env) {
       ...businesses.map(b => `business:${b.id} — ${b.name}`),
       ...contacts.map(c => `contact:${c.id} — ${c.name}`),
     ].join("\n");
-    instruction = `Transcribe the attached voice memo exactly, word for word.${vocabLine} This is a founder's spoken recap of a call/meeting they just finished — extract a structured brief from it.
+    instruction = `Transcribe the attached voice memo exactly, word for word — the ENTIRE recording, however long. Do not summarize, shorten, or cut off the transcript itself; put the complete verbatim transcript in the "transcript" field and save shortening for the separate "summary"/"highlights" fields below.${vocabLine} This is a founder's spoken recap of a call/meeting they just finished — extract a structured brief from it.
 
 Using ONLY this list of the founder's businesses and contacts, decide whether the recap clearly names one of them:
 ${catalog || "(none defined yet — always respond with matchType none)"}
@@ -449,7 +449,7 @@ highlights and actionItems should be short bullet-style phrases pulled from what
       ...businesses.map(b => `business:${b.id} — ${b.name}`),
       ...projects.map(p => `project:${p.id} — ${p.name}`),
     ].join("\n");
-    instruction = `Transcribe the attached voice memo exactly, word for word.${vocabLine}
+    instruction = `Transcribe the attached voice memo exactly, word for word — the ENTIRE recording, however long it is. Do not summarize, shorten, paraphrase, or cut off the transcript itself, no matter how long the memo runs; put the complete verbatim transcript in the "transcript" field and save any shortening for the separate "summary" field below.${vocabLine}
 
 Then, using ONLY this list of the founder's businesses and projects, decide whether the memo clearly belongs to one of them:
 ${catalog || "(none defined yet — always respond with matchType none)"}
@@ -457,7 +457,7 @@ ${catalog || "(none defined yet — always respond with matchType none)"}
 Also produce a one-line summary of what the idea actually is, and a short, punchy, actionable title suitable for a task-tracking "Mission" the founder would create when they're ready to act on this idea (imperative, concrete — e.g. "Pitch the loyalty-app concept to two clients", not "Loyalty app idea").
 
 Respond with ONLY this JSON object, no markdown fencing, no commentary:
-{"transcript": "...", "summary": "one line on what this idea is", "suggestedMissionTitle": "a short actionable mission title", "matchType": "business" | "project" | "none", "matchId": "the id portion after the colon above, or null", "confidence": 0.0 to 1.0}
+{"transcript": "the complete, unabridged, word-for-word transcript", "summary": "one line on what this idea is", "suggestedMissionTitle": "a short actionable mission title", "matchType": "business" | "project" | "none", "matchId": "the id portion after the colon above, or null", "confidence": 0.0 to 1.0}
 
 Only choose a match if the memo clearly names or strongly, unambiguously implies that specific business or project. If there's any real doubt, use "none" and confidence 0.`;
   }
@@ -480,7 +480,7 @@ Only choose a match if the memo clearly names or strongly, unambiguously implies
               { inlineData: { mimeType: body.mimeType, data: body.audioBase64 } },
             ],
           }],
-          generationConfig: { maxOutputTokens: mode === "meeting" ? 1400 : 1000, responseMimeType: "application/json" },
+          generationConfig: { maxOutputTokens: mode === "meeting" ? 4000 : 3000, responseMimeType: "application/json" },
         }),
       }
     );
@@ -506,10 +506,15 @@ Only choose a match if the memo clearly names or strongly, unambiguously implies
     parsed = JSON.parse(raw);
   } catch (e) {
     // Model didn't return clean JSON (rare, but responseMimeType isn't a
-    // hard guarantee) — still surface the raw text as the transcript
-    // rather than failing the capture outright. Falling back to no match
-    // is always safe.
-    parsed = { transcript: raw.trim() };
+    // hard guarantee — and a genuinely long recording could still get cut
+    // off mid-response even with a generous token budget). Rather than
+    // surfacing broken JSON syntax as the "transcript", pull just the
+    // transcript field's text back out with a regex — this handles both a
+    // fully malformed response and a response truncated mid-transcript
+    // (the closing quote just won't be there, so we take what's there).
+    const match = raw.match(/"transcript"\s*:\s*"((?:[^"\\]|\\.)*)"?/);
+    const salvaged = match ? match[1].replace(/\\"/g, '"').replace(/\\n/g, "\n") : raw.trim();
+    parsed = { transcript: salvaged };
   }
 
   if (mode === "meeting") {
