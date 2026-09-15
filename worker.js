@@ -626,6 +626,9 @@ Only choose a match if the idea clearly names or strongly, unambiguously implies
     confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
   }, 200);
 }
+
+/**
+ * Anthropic sub-handler for the provider-agnostic assistant above. Same
  * ANTHROPIC_API_KEY is a Worker secret, never sent to the browser. This is
  * the founder's OWN Anthropic Console account and billing, separate from
  * (and unrelated to) whatever Claude product built this app.
