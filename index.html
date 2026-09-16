@@ -929,6 +929,23 @@ input[type="range"].field-input{ padding: 0; height: 6px; background: rgba(255,2
   background: rgba(255,255,255,0.06); color: var(--text-secondary); border-radius: 999px;
   padding: 1px 8px; font-size: 10.5px;
 }
+.notif-badge{
+  position: absolute; top: -2px; right: -2px;
+  background: var(--amber, #ED8D01); color: #121212;
+  border-radius: 999px; font-size: 10px; font-weight: 700;
+  min-width: 16px; height: 16px; line-height: 16px; text-align: center; padding: 0 3px;
+}
+.notif-panel{
+  position: absolute; top: calc(100% + 10px); right: 0; width: 320px; max-width: 85vw;
+  z-index: 500; border-radius: var(--radius-3, 12px); overflow: hidden;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.4);
+}
+.notif-panel-header{ padding: 14px 16px 8px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-tertiary); }
+.notif-panel-empty{ padding: 8px 16px 16px; font-size: 13px; color: var(--text-secondary); }
+.notif-row{ display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 16px; border-top: 1px solid var(--panel-border); }
+.notif-row-title{ font-size: 13.5px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.notif-row-title svg{ width: 14px; height: 14px; flex-shrink: 0; }
+.notif-row-desc{ font-size: 12px; color: var(--text-tertiary); margin-top: 2px; }
 .opportunity-notes{ font-size: 12px; color: var(--text-tertiary); margin-top: 4px; line-height: 1.5; }
 .value-block{ text-align: right; margin-right: 4px; }
 .value-amount{ font-family: var(--font-mono); font-size: 15px; font-weight: 650; color: var(--green); }
@@ -1359,7 +1376,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 25,
+  SCHEMA_VERSION: 26,
   APP_NAME: "Founder OS",
   // Matches VAPID_PUBLIC_KEY in worker.js exactly — this half isn't
   // secret (only the private key, held server-side, needs to be), so
@@ -2005,6 +2022,9 @@ function getDefaultState(){
       maxWorkBlockMinutes: 240, // caps how long a single block gets even for a huge task — beyond this, it splits across multiple blocks with breaks between instead of one unbroken sit
       totalPlanMinutes: 480, // how much of the day auto-fill will schedule (8 hours)
     },
+    neglectSettings: {
+      thresholdDays: 5, // a business/project with no linked activity for this many days shows up in the notification bell
+    },
     opportunities: [],    // pipeline: Idea -> ... -> Completed
     ideas: [],            // Idea Vault inbox
     journalEntries: [],   // CEO Journal, one per calendar day
@@ -2381,6 +2401,12 @@ function migrateState(state){
       state.focusSettings = { workBlockMinutes: 120, breakMinutes: 15, maxWorkBlockMinutes: 240, totalPlanMinutes: 480 };
     }
     state.schemaVersion = 25;
+  }
+  // v25 -> v26: neglect detection (the notification bell now does
+  // something real instead of sitting there decoratively).
+  if(state.schemaVersion < 26){
+    if(state.neglectSettings === undefined) state.neglectSettings = { thresholdDays: 5 };
+    state.schemaVersion = 26;
   }
   return state;
 }
@@ -3002,6 +3028,71 @@ function stopDayPlan(){
   }
   plan.currentBlockIndex = -1;
   saveState();
+  renderApp();
+}
+
+/* ==========================================================================
+   SECTION: NEGLECT DETECTION
+   The thing that makes this not just a to-do list: proactively surfacing
+   "you haven't touched Business X in 6 days" instead of relying on the
+   founder to notice a business quietly going stale while another one eats
+   all their attention. Computed from timestamps that already exist on
+   missions/projects/etc. — no separate "last touched" tracking to keep in
+   sync, just take the max updatedAt across everything linked to a
+   business or project.
+   ========================================================================== */
+function businessLastActivityAt(businessId){
+  let latest = 0;
+  STATE.missions.forEach(m => { if(m.businessId === businessId) latest = Math.max(latest, m.updatedAt); });
+  STATE.projects.forEach(p => { if(p.businessId === businessId) latest = Math.max(latest, p.updatedAt); });
+  STATE.opportunities.forEach(o => { if(o.businessId === businessId) latest = Math.max(latest, o.updatedAt); });
+  STATE.notes.forEach(n => { if(n.businessId === businessId) latest = Math.max(latest, n.updatedAt); });
+  STATE.focusSessions.forEach(s => {
+    const mission = STATE.missions.find(m => m.id === s.missionId);
+    if(mission && mission.businessId === businessId) latest = Math.max(latest, s.endedAt);
+  });
+  return latest || null; // null = genuinely never touched, distinct from "touched a long time ago"
+}
+function projectLastActivityAt(projectId){
+  let latest = 0;
+  STATE.missions.forEach(m => { if(m.projectId === projectId) latest = Math.max(latest, m.updatedAt); });
+  STATE.focusSessions.forEach(s => {
+    const mission = STATE.missions.find(m => m.id === s.missionId);
+    if(mission && mission.projectId === projectId) latest = Math.max(latest, s.endedAt);
+  });
+  return latest || null;
+}
+function daysSince(timestamp){
+  return Math.floor((Date.now() - timestamp) / (1000 * 60 * 60 * 24));
+}
+
+// Returns businesses AND active projects that haven't seen any linked
+// activity in longer than the configured threshold, sorted most-neglected
+// first. A brand new business/project with genuinely zero activity yet
+// isn't "neglected" — it just hasn't started, which is a different thing.
+function getNeglectedItems(){
+  const thresholdDays = STATE.neglectSettings.thresholdDays;
+  const items = [];
+  STATE.businesses.forEach(b => {
+    const last = businessLastActivityAt(b.id);
+    if(last !== null && daysSince(last) >= thresholdDays){
+      items.push({ type: "business", id: b.id, name: b.name, days: daysSince(last) });
+    }
+  });
+  STATE.projects.filter(p => p.status === "active").forEach(p => {
+    const last = projectLastActivityAt(p.id);
+    if(last !== null && daysSince(last) >= thresholdDays){
+      const biz = businessById(p.businessId);
+      items.push({ type: "project", id: p.id, name: p.name, bizName: biz ? biz.name : "", days: daysSince(last) });
+    }
+  });
+  items.sort((a, b) => b.days - a.days);
+  return items;
+}
+
+let notificationPanelOpen = false;
+function toggleNotificationPanel(){
+  notificationPanelOpen = !notificationPanelOpen;
   renderApp();
 }
 
@@ -7922,6 +8013,20 @@ function renderSettings(){
       </div>
 
       <div class="card glass col-12">
+        <h3 class="card-title"><span class="card-icon">${icon("bell")}</span>Neglect Detection</h3>
+        <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);">
+          A business or active project with no linked activity (missions, focus sessions, notes, opportunities) for this many days shows up in the notification bell.
+        </div>
+        <form id="neglectSettingsForm" class="field-row">
+          <div class="field" style="max-width:160px;">
+            <label class="field-label">Days before flagging</label>
+            <input class="field-input" type="number" min="1" step="1" name="thresholdDays" value="${STATE.neglectSettings.thresholdDays}" />
+          </div>
+          <div style="align-self:flex-end;"><button type="submit" class="btn btn-primary btn-sm">Save</button></div>
+        </form>
+      </div>
+
+      <div class="card glass col-12">
         <h3 class="card-title" style="color: var(--red)">Danger Zone</h3>
         <div class="danger-zone" style="display:flex; align-items:center; justify-content:space-between; gap: var(--space-4); flex-wrap: wrap;">
           <div>
@@ -8443,6 +8548,7 @@ function renderTopbar(){
   const season = STATE.season;
   const now = new Date();
   const dateStr = now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
+  const neglected = getNeglectedItems();
   return `
   <header class="topbar">
     <div class="topbar-left">
@@ -8454,10 +8560,29 @@ function renderTopbar(){
       <button class="icon-btn" data-action="open-command-palette" title="Search & commands (${isMac ? "⌘K" : "Ctrl+K"})" aria-label="Open command palette">${icon("search")}</button>
       ${season ? `<button class="season-chip" data-action="open-season-modal" style="cursor:pointer;"><span class="season-dot"></span><span class="season-chip-text">${escapeHtml(season.name)} SEASON · DAY ${dayOfSeason(season)}</span></button>` : ""}
       <button class="icon-btn" title="Capture an idea" data-action="quick-capture-idea">${icon("bulb")}</button>
-      <button class="icon-btn" title="Notifications">${icon("bell")}</button>
+      <div style="position:relative;">
+        <button class="icon-btn" title="Notifications" data-action="toggle-notification-panel">${icon("bell")}${neglected.length ? `<span class="notif-badge">${neglected.length > 9 ? "9+" : neglected.length}</span>` : ""}</button>
+        ${notificationPanelOpen ? renderNotificationPanel(neglected) : ""}
+      </div>
       <button class="icon-btn" title="Help Center" data-action="open-help-center">${icon("help")}</button>
     </div>
   </header>`;
+}
+
+function renderNotificationPanel(neglected){
+  const rows = neglected.map(item => `
+    <div class="notif-row">
+      <div>
+        <div class="notif-row-title">${item.type === "business" ? icon("target") : icon("focus")} ${escapeHtml(item.name)}</div>
+        <div class="notif-row-desc">${item.type === "project" ? `${escapeHtml(item.bizName)} · ` : ""}Nothing touched in ${item.days} day${item.days === 1 ? "" : "s"}</div>
+      </div>
+      <button class="btn btn-ghost btn-sm" data-action="close-notification-and-navigate" data-view="${item.type === "business" ? "portfolio" : "projects"}">Look</button>
+    </div>`).join("");
+  return `
+  <div class="notif-panel glass">
+    <div class="notif-panel-header">Needs attention</div>
+    ${rows || `<div class="notif-panel-empty">Nothing's been neglected — everything's had activity within ${STATE.neglectSettings.thresholdDays} days.</div>`}
+  </div>`;
 }
 
 function currentViewTitle(){
@@ -8800,6 +8925,17 @@ function bindEvents(){
       showToast("Focus settings saved — regenerate today's plan to apply them");
     });
   }
+  const neglectSettingsForm = document.getElementById("neglectSettingsForm");
+  if(neglectSettingsForm){
+    neglectSettingsForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      STATE.neglectSettings = { thresholdDays: Math.max(1, Number(fd.get("thresholdDays")) || 5) };
+      saveState();
+      renderApp();
+      showToast("Neglect detection settings saved");
+    });
+  }
 
   const syncDriveBtn = document.querySelector('[data-action="sync-drive-now"]');
   if(syncDriveBtn){
@@ -8818,6 +8954,15 @@ function bindEvents(){
 
   const quickCaptureBtn = document.querySelector('[data-action="quick-capture-idea"]');
   if(quickCaptureBtn) quickCaptureBtn.addEventListener("click", () => openIdeaQuickCaptureModal());
+
+  const notifBellBtn = document.querySelector('[data-action="toggle-notification-panel"]');
+  if(notifBellBtn) notifBellBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleNotificationPanel(); });
+  document.querySelectorAll('[data-action="close-notification-and-navigate"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      notificationPanelOpen = false;
+      navigateTo(btn.getAttribute("data-view"));
+    });
+  });
 
   bindPortfolioEvents();
   bindProjectEvents();
