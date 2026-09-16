@@ -1376,7 +1376,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 26,
+  SCHEMA_VERSION: 27,
   APP_NAME: "Founder OS",
   // Matches VAPID_PUBLIC_KEY in worker.js exactly — this half isn't
   // secret (only the private key, held server-side, needs to be), so
@@ -1431,6 +1431,7 @@ const NAV_ITEMS = [
   { id: "portfolio",     label: "Portfolio",     icon: "layers",   built: true  },
   { id: "projects",      label: "Projects",      icon: "folder",   built: true  },
   { id: "missions",      label: "Missions",      icon: "target",   built: true  },
+  { id: "goals",         label: "Goals",         icon: "flag",     built: true  },
   { id: "templates",     label: "Templates",     icon: "template", built: true  },
   { id: "calendarsync",  label: "Calendar",      icon: "extcal",   built: true  },
   { id: "focus",         label: "Focus",         icon: "focus",    built: true  },
@@ -1477,6 +1478,9 @@ const TOUR_CONTENT = {
   missions: [
     { title: "Missions List", blurb: "The highest-leverage moves broken into concrete tasks, sorted by impact score — this is where strategy turns into action, not just a flat to-do list.", target: "missions-list" },
     { title: "Priority, Status & Filtering", blurb: "Filter by business, project, or status, and each mission carries a priority and time estimate — so you can tell what's worth your next focus block at a glance.", target: "missions-toolbar" },
+  ],
+  goals: [
+    { title: "SMART Goals", blurb: "Specific, measurable, tied to a real business, with a deadline — and for anything recurring, a daily or weekly check-in that builds an honest streak instead of a vague intention." },
   ],
   templates: [
     { title: "Mission Templates", blurb: "Recurring work — a client onboarding, an edit reel, a proposal — saved once with its checklist and time estimate, so you're never rebuilding the same mission from scratch." },
@@ -1561,6 +1565,7 @@ const ICONS = {
   extcal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/><path d="M8 13h2M8 17h2M14 13h2M14 17h2"/></svg>',
   refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 4v5h-5"/></svg>',
   popout: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="12" height="10" rx="1.5"/><path d="M14 14l7-7M21 3h-5M21 3v5"/></svg>',
+  flag: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 21V4"/><path d="M4 4h13l-2.5 4L17 12H4"/></svg>',
   assistant: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3a7 7 0 0 0-7 7c0 2.4 1.15 4.53 2.93 5.87L7 21l3.5-1.8c.48.13.99.2 1.5.2a7 7 0 0 0 0-14Z"/><circle cx="9" cy="10" r="0.9" fill="currentColor" stroke="none"/><circle cx="12" cy="10" r="0.9" fill="currentColor" stroke="none"/><circle cx="15" cy="10" r="0.9" fill="currentColor" stroke="none"/></svg>',
   mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 19v3M8 22h8"/></svg>',
   micOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 2l20 20M9 9v3a3 3 0 0 0 4.6 2.55M15 9.4V5a3 3 0 0 0-5.9-.8M5 10a7 7 0 0 0 10.3 6.15M19 10a7 7 0 0 1-.6 2.85M12 19v3M8 22h8"/></svg>',
@@ -1617,6 +1622,33 @@ function MissionModel(overrides){
     status: "active", // active | completed | archived
     completedAt: null, // set when status transitions to "completed"
     tasks: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  }, overrides);
+}
+
+// SMART goals — Specific/Measurable built into the fields themselves,
+// Achievable is a creation-time prompt rather than anything enforced,
+// Relevant is the business link, Time-bound is the deadline. cadence
+// turns a goal into a daily/weekly accountability habit: checkIns is the
+// log of "did I actually do the thing" answers that streaks are computed
+// from, not a separate habit-tracker bolted on afterward.
+function GoalModel(overrides){
+  return Object.assign({
+    id: makeId("goal"),
+    title: "Untitled Goal",
+    specific: "", // what exactly, precisely — not "grow the business", but what growing it looks like
+    measurable: "", // how you'll know — e.g. "10 new signups", "publish 3x/week"
+    achievableNote: "", // a reality-check the founder writes for themselves at creation time, never graded
+    businessId: null, // relevant — ties the goal to something real, not floating free
+    deadline: null, // time-bound
+    targetValue: null, // optional numeric target, e.g. 10
+    currentValue: 0, // optional numeric progress toward targetValue
+    unit: "", // e.g. "clients", "posts", "kg" — purely a display label
+    cadence: "none", // "none" | "daily" | "weekly" — none means a one-shot goal with no check-in rhythm
+    checkIns: [], // [{ date: "YYYY-MM-DD", done: true|false }] — the actual accountability record
+    status: "active", // active | completed | abandoned
+    completedAt: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
   }, overrides);
@@ -2026,6 +2058,7 @@ function getDefaultState(){
       thresholdDays: 5, // a business/project with no linked activity for this many days shows up in the notification bell
     },
     opportunities: [],    // pipeline: Idea -> ... -> Completed
+    goals: [],             // SMART goals — see GoalModel
     ideas: [],            // Idea Vault inbox
     journalEntries: [],   // CEO Journal, one per calendar day
     founder: null,        // FounderProfileModel, set by the Setup Wizard; stays null on the demo path
@@ -2407,6 +2440,11 @@ function migrateState(state){
   if(state.schemaVersion < 26){
     if(state.neglectSettings === undefined) state.neglectSettings = { thresholdDays: 5 };
     state.schemaVersion = 26;
+  }
+  // v26 -> v27: SMART goals + daily/weekly accountability tracking.
+  if(state.schemaVersion < 27){
+    if(state.goals === undefined) state.goals = [];
+    state.schemaVersion = 27;
   }
   return state;
 }
@@ -3364,6 +3402,77 @@ function createMissionFromTemplate(tmpl, projectId){
   });
 }
 
+// ---- Goals ----
+function goalById(id){
+  return STATE.goals.find(g => g.id === id) || null;
+}
+function createGoal(data){
+  const goal = GoalModel(data);
+  STATE.goals.push(goal);
+  logActivity("mission", `Set a new goal <b>${escapeHtml(goal.title)}</b>`);
+  saveState();
+  return goal;
+}
+function updateGoal(id, data){
+  const goal = goalById(id);
+  if(!goal) return;
+  Object.assign(goal, data, { updatedAt: Date.now() });
+  saveState();
+}
+function deleteGoal(id){
+  STATE.goals = STATE.goals.filter(g => g.id !== id);
+  saveState();
+}
+function completeGoal(id){
+  const goal = goalById(id);
+  if(!goal) return;
+  goal.status = "completed";
+  goal.completedAt = Date.now();
+  goal.updatedAt = Date.now();
+  logActivity("mission", `Completed goal <b>${escapeHtml(goal.title)}</b> 🎉`);
+  saveState();
+}
+
+function todayLocalDateString(){
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+// Records today's (or a given day's) honest yes/no on a cadence goal.
+// Re-checking-in on the same day overwrites rather than duplicating —
+// the point is an accurate record, not encouraging multiple taps.
+function checkInGoal(id, done, dateStr){
+  const goal = goalById(id);
+  if(!goal) return;
+  const date = dateStr || todayLocalDateString();
+  const existing = goal.checkIns.find(c => c.date === date);
+  if(existing) existing.done = done;
+  else goal.checkIns.push({ date, done });
+  goal.updatedAt = Date.now();
+  saveState();
+}
+function goalCheckInForDate(goal, dateStr){
+  return goal.checkIns.find(c => c.date === (dateStr || todayLocalDateString())) || null;
+}
+// Consecutive-day streak counting backward from today (or the most recent
+// expected check-in day for weekly cadence) — breaks the moment a day is
+// missing or explicitly marked not-done, so a streak is always honest,
+// never inferred generously.
+function goalStreak(goal){
+  if(goal.cadence === "none") return 0;
+  const stepDays = goal.cadence === "weekly" ? 7 : 1;
+  let streak = 0;
+  const cursor = new Date();
+  for(let i = 0; i < 366; i++){
+    const dateStr = `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, "0")}-${String(cursor.getDate()).padStart(2, "0")}`;
+    const entry = goal.checkIns.find(c => c.date === dateStr);
+    if(i === 0 && !entry) { cursor.setDate(cursor.getDate() - stepDays); continue; } // today not checked in yet doesn't break a streak that starts yesterday
+    if(!entry || !entry.done) break;
+    streak++;
+    cursor.setDate(cursor.getDate() - stepDays);
+  }
+  return streak;
+}
+
 // ---- Mission ----
 function createMission(data){
   const mission = MissionModel(data);
@@ -4122,7 +4231,7 @@ const DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3";
 const DRIVE_FILE_NAME = "founderos-state.json";
 const SYNC_COLLECTION_KEYS = [
   "businesses", "projects", "missions", "missionTemplates", "opportunities",
-  "ideas", "contacts", "communications", "notes",
+  "ideas", "contacts", "communications", "notes", "goals",
   "knowledgeArticles", "journal",
 ];
 
@@ -5833,6 +5942,176 @@ function renderMissions(){
       ${cards || `<div class="card glass col-12">${emptyState("target", "No missions match this filter", "Adjust the filters above, or queue a new mission.")}</div>`}
     </div>
   </div>`;
+}
+
+/* --------------------------------------------------------------------------
+   SMART GOALS
+   Specific/Measurable are real fields, not just a title; Achievable is a
+   creation-time gut-check the founder writes for themselves (never
+   graded); Relevant is the business link; Time-bound is the deadline.
+   cadence turns a goal into a daily/weekly accountability habit — the
+   actual "are you doing what you say you'll do" tracking, via checkIns.
+   -------------------------------------------------------------------------- */
+function renderGoals(){
+  const active = STATE.goals.filter(g => g.status === "active");
+  const completed = STATE.goals.filter(g => g.status !== "active");
+
+  const cadenceGoals = active.filter(g => g.cadence !== "none");
+  const oneShotGoals = active.filter(g => g.cadence === "none");
+
+  const renderGoalCard = (goal) => {
+    const biz = goal.businessId ? businessById(goal.businessId) : null;
+    const streak = goalStreak(goal);
+    const todayCheckIn = goalCheckInForDate(goal);
+    const hasNumericTarget = goal.targetValue !== null && goal.targetValue > 0;
+    const progressPct = hasNumericTarget ? Math.min(100, Math.round((goal.currentValue / goal.targetValue) * 100)) : null;
+    const daysLeft = goal.deadline ? Math.ceil((goal.deadline - Date.now()) / (1000 * 60 * 60 * 24)) : null;
+
+    return `
+    <div class="card glass col-12" style="margin-bottom:var(--space-3);">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div style="flex:1;min-width:0;">
+          <div class="mission-title">${escapeHtml(goal.title)}</div>
+          ${goal.specific ? `<div class="opportunity-notes" style="margin-top:4px;">${escapeHtml(goal.specific)}</div>` : ""}
+          <div class="mission-meta" style="margin-top:8px;">
+            ${biz ? `<span class="tag tag-biz">${escapeHtml(biz.name)}</span>` : ""}
+            ${goal.cadence !== "none" ? `<span class="tag tag-time">${icon("flag")} ${streak}-${goal.cadence === "weekly" ? "week" : "day"} streak</span>` : ""}
+            ${daysLeft !== null ? `<span class="tag ${daysLeft < 0 ? "tag-priority-high" : "tag-time"}">${daysLeft < 0 ? `${Math.abs(daysLeft)}d overdue` : `${daysLeft}d left`}</span>` : ""}
+          </div>
+          ${hasNumericTarget ? `
+            <div style="margin-top:10px;">
+              <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-tertiary);margin-bottom:4px;">
+                <span>${goal.currentValue} / ${goal.targetValue} ${escapeHtml(goal.unit)}</span><span>${progressPct}%</span>
+              </div>
+              <div class="progress-track"><div class="progress-fill" style="width:${progressPct}%;"></div></div>
+            </div>` : ""}
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end;">
+          ${goal.cadence !== "none" ? `
+            <div style="display:flex;gap:4px;">
+              <button class="btn ${todayCheckIn && todayCheckIn.done ? "btn-primary" : "btn-ghost"} btn-sm" data-action="goal-checkin" data-id="${goal.id}" data-done="true">${icon("check")} Did it</button>
+              <button class="btn ${todayCheckIn && !todayCheckIn.done ? "btn-primary" : "btn-ghost"} btn-sm" data-action="goal-checkin" data-id="${goal.id}" data-done="false">Skipped</button>
+            </div>` : ""}
+          <div style="display:flex;gap:4px;">
+            <button class="icon-btn" data-action="edit-goal" data-id="${goal.id}" title="Edit">${icon("edit")}</button>
+            <button class="icon-btn" data-action="complete-goal" data-id="${goal.id}" title="Mark complete">${icon("check")}</button>
+            <button class="icon-btn" data-action="delete-goal" data-id="${goal.id}" title="Delete">${icon("trash")}</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  };
+
+  return `
+  <div class="view-enter">
+    <div class="toolbar">
+      <div class="toolbar-filters"><div style="font-size:13px;color:var(--text-secondary);">Are you doing what you said you'd do?</div></div>
+      <button class="btn btn-primary" data-action="new-goal">${icon("plus")} New goal</button>
+    </div>
+
+    ${cadenceGoals.length ? `
+      <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:0.04em;color:var(--text-tertiary);margin:var(--space-4) 0 var(--space-2);">Daily &amp; weekly accountability</h3>
+      ${cadenceGoals.map(renderGoalCard).join("")}` : ""}
+
+    ${oneShotGoals.length ? `
+      <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:0.04em;color:var(--text-tertiary);margin:var(--space-4) 0 var(--space-2);">One-time goals</h3>
+      ${oneShotGoals.map(renderGoalCard).join("")}` : ""}
+
+    ${!active.length ? `<div class="card glass col-12">${emptyState("flag", "No goals set yet", "Set a SMART goal — specific, measurable, tied to a real business, with a deadline — and check in daily or weekly to build an honest streak.")}</div>` : ""}
+
+    ${completed.length ? `
+      <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:0.04em;color:var(--text-tertiary);margin:var(--space-4) 0 var(--space-2);">Completed / abandoned</h3>
+      ${completed.map(g => `<div class="mission-row" style="opacity:0.6;"><div class="mission-main"><div class="mission-title">${escapeHtml(g.title)}</div></div><button class="icon-btn" data-action="delete-goal" data-id="${g.id}" title="Delete">${icon("trash")}</button></div>`).join("")}` : ""}
+  </div>`;
+}
+
+// A guided SMART form rather than one free-text box — walking through
+// Specific/Measurable/Achievable/Relevant/Time-bound as separate prompts
+// is the actual point: it's easy to write a vague goal in one box, harder
+// to when each part demands its own answer.
+function openGoalModal(goal){
+  const isEdit = !!goal;
+  const g = goal || GoalModel({});
+  const bizOptions = STATE.businesses.map(b => `<option value="${b.id}" ${g.businessId === b.id ? "selected" : ""}>${escapeHtml(b.name)}</option>`).join("");
+  const deadlineVal = g.deadline ? new Date(g.deadline).toISOString().slice(0, 10) : "";
+
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">${isEdit ? "Edit goal" : "New SMART goal"}</div>
+      <button class="modal-close" data-modal-close>${icon("close")}</button>
+    </div>
+    <form id="goalForm">
+      <div class="field">
+        <label class="field-label">Title</label>
+        <input class="field-input" name="title" required value="${escapeHtml(g.title)}" placeholder="e.g. Land 3 new retainer clients" />
+      </div>
+      <div class="field">
+        <label class="field-label">Specific — what exactly does this mean?</label>
+        <textarea class="field-textarea" name="specific" style="min-height:60px;" placeholder="Not 'grow the business' — what precisely are you doing?">${escapeHtml(g.specific)}</textarea>
+      </div>
+      <div class="field">
+        <label class="field-label">Measurable — how will you know?</label>
+        <input class="field-input" name="measurable" value="${escapeHtml(g.measurable)}" placeholder="e.g. 3 signed retainer contracts" />
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label class="field-label">Target number (optional)</label>
+          <input class="field-input" type="number" name="targetValue" value="${g.targetValue !== null ? g.targetValue : ""}" placeholder="e.g. 3" />
+        </div>
+        <div class="field">
+          <label class="field-label">Unit</label>
+          <input class="field-input" name="unit" value="${escapeHtml(g.unit)}" placeholder="e.g. clients" />
+        </div>
+      </div>
+      <div class="field">
+        <label class="field-label">Achievable — honest gut check (just for you, never graded)</label>
+        <input class="field-input" name="achievableNote" value="${escapeHtml(g.achievableNote)}" placeholder="Is this actually realistic given everything else on your plate?" />
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label class="field-label">Relevant — which business?</label>
+          <select class="field-select" name="businessId"><option value="">— Not tied to one —</option>${bizOptions}</select>
+        </div>
+        <div class="field">
+          <label class="field-label">Time-bound — deadline</label>
+          <input class="field-input" type="date" name="deadline" value="${deadlineVal}" />
+        </div>
+      </div>
+      <div class="field">
+        <label class="field-label">Check-in rhythm</label>
+        <select class="field-select" name="cadence">
+          <option value="none" ${g.cadence === "none" ? "selected" : ""}>One-time goal — no recurring check-in</option>
+          <option value="daily" ${g.cadence === "daily" ? "selected" : ""}>Daily — did you do it today?</option>
+          <option value="weekly" ${g.cadence === "weekly" ? "selected" : ""}>Weekly</option>
+        </select>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">${isEdit ? "Save changes" : "Set goal"}</button>
+      </div>
+    </form>
+  `, (root) => {
+    root.querySelector("#goalForm").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const targetRaw = fd.get("targetValue");
+      const data = {
+        title: fd.get("title").trim() || "Untitled Goal",
+        specific: fd.get("specific").trim(),
+        measurable: fd.get("measurable").trim(),
+        targetValue: targetRaw ? Number(targetRaw) : null,
+        unit: fd.get("unit").trim(),
+        achievableNote: fd.get("achievableNote").trim(),
+        businessId: fd.get("businessId") || null,
+        deadline: fd.get("deadline") ? new Date(fd.get("deadline")).getTime() : null,
+        cadence: fd.get("cadence"),
+      };
+      if(isEdit){ updateGoal(g.id, data); showToast("Goal updated"); }
+      else{ createGoal(data); showToast("Goal set — you've got this"); }
+      closeModal();
+      renderApp();
+    });
+  });
 }
 
 /* --------------------------------------------------------------------------
@@ -8053,6 +8332,7 @@ const VIEW_RENDERERS = {
   portfolio: renderPortfolio,
   projects: renderProjects,
   missions: renderMissions,
+  goals: renderGoals,
   templates: renderTemplates,
   calendarsync: renderCalendarSync,
   focus: renderFocusPicker,
@@ -8970,6 +9250,7 @@ function bindEvents(){
   bindCalendarSyncEvents();
   bindAssistantEvents();
   bindMissionEvents();
+  bindGoalEvents();
   bindRecoveryEvents();
   bindOpportunityEvents();
   bindIdeaVaultEvents();
@@ -9146,6 +9427,37 @@ function bindMissionEvents(){
       renderApp();
     });
   }
+}
+
+/* ---- Goal bindings ---- */
+function bindGoalEvents(){
+  const newGoalBtn = document.querySelector('[data-action="new-goal"]');
+  if(newGoalBtn) newGoalBtn.addEventListener("click", () => openGoalModal(null));
+
+  document.querySelectorAll('[data-action="edit-goal"]').forEach(btn => {
+    btn.addEventListener("click", () => openGoalModal(goalById(btn.getAttribute("data-id"))));
+  });
+  document.querySelectorAll('[data-action="complete-goal"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      completeGoal(btn.getAttribute("data-id"));
+      showToast("Goal completed 🎉");
+      renderApp();
+    });
+  });
+  document.querySelectorAll('[data-action="delete-goal"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      deleteGoal(btn.getAttribute("data-id"));
+      renderApp();
+    });
+  });
+  document.querySelectorAll('[data-action="goal-checkin"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      const done = btn.getAttribute("data-done") === "true";
+      checkInGoal(btn.getAttribute("data-id"), done);
+      showToast(done ? "Nice — logged" : "Logged — tomorrow's a fresh shot");
+      renderApp();
+    });
+  });
 }
 
 /* ---- Recovery bindings ---- */
