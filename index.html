@@ -505,6 +505,7 @@ button{ font-family: inherit; }
   padding: var(--space-4) 0; border-bottom: 1px solid var(--panel-border);
 }
 .mission-row:last-child{ border-bottom: none; padding-bottom: 0; }
+.mission-row-active{ background: rgba(237,141,1,0.08); border-radius: var(--radius-2, 8px); padding-left: 10px; padding-right: 10px; margin: 0 -10px; }
 .mission-rank{
   font-family: var(--font-mono); font-size: 12px; color: var(--text-tertiary);
   width: 22px; flex-shrink: 0; text-align: center;
@@ -1358,7 +1359,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 24,
+  SCHEMA_VERSION: 25,
   APP_NAME: "Founder OS",
   // Matches VAPID_PUBLIC_KEY in worker.js exactly — this half isn't
   // secret (only the private key, held server-side, needs to be), so
@@ -1542,6 +1543,7 @@ const ICONS = {
   content: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="14" rx="2"/><path d="m9 8 6 3-6 3V8Z" fill="currentColor" stroke="none"/><path d="M3 21h18"/></svg>',
   extcal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/><path d="M8 13h2M8 17h2M14 13h2M14 17h2"/></svg>',
   refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 4v5h-5"/></svg>',
+  popout: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="12" height="10" rx="1.5"/><path d="M14 14l7-7M21 3h-5M21 3v5"/></svg>',
   assistant: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3a7 7 0 0 0-7 7c0 2.4 1.15 4.53 2.93 5.87L7 21l3.5-1.8c.48.13.99.2 1.5.2a7 7 0 0 0 0-14Z"/><circle cx="9" cy="10" r="0.9" fill="currentColor" stroke="none"/><circle cx="12" cy="10" r="0.9" fill="currentColor" stroke="none"/><circle cx="15" cy="10" r="0.9" fill="currentColor" stroke="none"/></svg>',
   mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 19v3M8 22h8"/></svg>',
   micOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 2l20 20M9 9v3a3 3 0 0 0 4.6 2.55M15 9.4V5a3 3 0 0 0-5.9-.8M5 10a7 7 0 0 0 10.3 6.15M19 10a7 7 0 0 1-.6 2.85M12 19v3M8 22h8"/></svg>',
@@ -1689,6 +1691,41 @@ function FocusSessionModel(overrides){
     endedAt: Date.now(),
     durationMinutes: 0,
     completedMission: false, // true if "Complete Mission" ended the session
+  }, overrides);
+}
+
+// One block in a generated day plan — either a work block tied to a
+// specific mission, or a break. Block length FLEXES to the mission's own
+// remaining estimated time (capped by focusSettings.maxWorkBlockMinutes)
+// rather than always being the same size — a task that genuinely needs
+// 6 hours gets a longer block (or gets split across multiple blocks with
+// breaks between, if it exceeds the cap — which is a deliberate choice:
+// forcing a break partway through a very long task is healthier than one
+// unbroken multi-hour sit).
+function FocusBlockModel(overrides){
+  return Object.assign({
+    id: makeId("block"),
+    type: "work", // "work" | "break"
+    missionId: null, // work blocks only
+    plannedMinutes: 60,
+    status: "planned", // planned | active | done | skipped
+    reminderId: null, // the scheduled push reminder for when this block's time is up
+  }, overrides);
+}
+
+// One generated plan for one calendar day. Regenerated on demand (see
+// generateDayPlan) rather than auto-invalidating on every mission edit —
+// predictable beats clever here, since silently reshuffling someone's
+// already-in-progress day would be worse than requiring an explicit
+// "Regenerate" tap.
+function DayPlanModel(overrides){
+  return Object.assign({
+    id: makeId("dayplan"),
+    date: "", // "YYYY-MM-DD", local date
+    blocks: [],
+    currentBlockIndex: -1, // -1 = plan generated but not started yet
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
   }, overrides);
 }
 
@@ -1959,6 +1996,15 @@ function getDefaultState(){
     activeBreak: null,    // active recovery break, null when idle: { startedAt }
     focusSessions: [],    // history of completed/paused-out deep work sessions
     breaks: [],           // history of completed recovery breaks
+    dayPlan: null,        // today's generated work/break plan — see generateDayPlan()
+    focusSettings: {
+      // Defaults chosen to match a "2 hours on, break, 2 hours on
+      // something else" rhythm — all adjustable in Settings.
+      workBlockMinutes: 120, // fallback length when a mission has no estimate to size a block from
+      breakMinutes: 15,
+      maxWorkBlockMinutes: 240, // caps how long a single block gets even for a huge task — beyond this, it splits across multiple blocks with breaks between instead of one unbroken sit
+      totalPlanMinutes: 480, // how much of the day auto-fill will schedule (8 hours)
+    },
     opportunities: [],    // pipeline: Idea -> ... -> Completed
     ideas: [],            // Idea Vault inbox
     journalEntries: [],   // CEO Journal, one per calendar day
@@ -2324,6 +2370,17 @@ function migrateState(state){
       if(i.suggestedMissionTitle === undefined) i.suggestedMissionTitle = "";
     });
     state.schemaVersion = 24;
+  }
+  // v24 -> v25: real focus/break scheduling (day plans made of sized work
+  // and break blocks) replaces the old "one manual timer, no breaks"
+  // Focus Mode. Nobody has a plan yet — that's fine, it's generated
+  // on-demand, not something to backfill from nothing.
+  if(state.schemaVersion < 25){
+    if(state.dayPlan === undefined) state.dayPlan = null;
+    if(state.focusSettings === undefined){
+      state.focusSettings = { workBlockMinutes: 120, breakMinutes: 15, maxWorkBlockMinutes: 240, totalPlanMinutes: 480 };
+    }
+    state.schemaVersion = 25;
   }
   return state;
 }
@@ -2828,6 +2885,223 @@ function liveElapsedMinutes(session){
 }
 function missionRemainingMinutes(mission, liveMinutes){
   return Math.max(0, Math.round(mission.estimatedMinutes - mission.timeSpentMinutes - (liveMinutes || 0)));
+}
+
+/* ==========================================================================
+   SECTION: DAY PLAN (real focus/break scheduling)
+   Auto-fills today with a sequence of work blocks (one per active mission,
+   sized to that mission's own remaining estimated time — not a fixed
+   length) interspersed with breaks, up to focusSettings.totalPlanMinutes.
+   Deliberately built as a thin orchestration layer on top of the EXISTING
+   startFocusSession/endFocusSession/startBreak/endBreak — a plan is just
+   something that decides which of those to call next and reminds you when
+   a block's time is up (via the push infrastructure), not a parallel
+   session-tracking system.
+   ========================================================================== */
+function todayDateString(){
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function generateDayPlan(){
+  const settings = STATE.focusSettings;
+  const priorityOrder = { high: 0, medium: 1, low: 2 };
+  const missions = STATE.missions
+    .filter(m => m.status === "active")
+    .sort((a, b) => (priorityOrder[a.priority] - priorityOrder[b.priority]) || (b.impactScore - a.impactScore));
+
+  const blocks = [];
+  let totalMinutes = 0;
+  for(const mission of missions){
+    if(totalMinutes >= settings.totalPlanMinutes) break;
+    let remaining = missionRemainingMinutes(mission) || settings.workBlockMinutes; // a mission with no real estimate still gets a default-length block rather than being skipped entirely
+    while(remaining > 0 && totalMinutes < settings.totalPlanMinutes){
+      const blockLen = Math.min(remaining, settings.maxWorkBlockMinutes, settings.totalPlanMinutes - totalMinutes);
+      if(blockLen <= 0) break;
+      blocks.push(FocusBlockModel({ type: "work", missionId: mission.id, plannedMinutes: blockLen }));
+      totalMinutes += blockLen;
+      remaining -= blockLen;
+      if(remaining > 0 || totalMinutes < settings.totalPlanMinutes){
+        const breakLen = Math.min(settings.breakMinutes, settings.totalPlanMinutes - totalMinutes);
+        if(breakLen <= 0) break;
+        blocks.push(FocusBlockModel({ type: "break", plannedMinutes: breakLen }));
+        totalMinutes += breakLen;
+      }
+    }
+  }
+  while(blocks.length && blocks[blocks.length - 1].type === "break") blocks.pop(); // no point ending the plan on a break
+
+  const plan = DayPlanModel({ date: todayDateString(), blocks });
+  STATE.dayPlan = plan;
+  saveState();
+  return plan;
+}
+
+async function scheduleBlockReminder(block){
+  const mission = block.missionId ? STATE.missions.find(m => m.id === block.missionId) : null;
+  const title = block.type === "work" ? "Focus block done" : "Break's over";
+  const body = block.type === "work"
+    ? `Time's up on "${mission ? mission.title : "your task"}" — still going, or ready for a break?`
+    : "Back to it whenever you're ready.";
+  const id = await schedulePushReminder({
+    dueAt: Date.now() + block.plannedMinutes * 60000,
+    title, body, tag: "focus-block", url: "./",
+  });
+  block.reminderId = id;
+  saveState();
+}
+
+function startPlanBlock(index){
+  const plan = STATE.dayPlan;
+  if(!plan || !plan.blocks[index]) return;
+  const block = plan.blocks[index];
+  plan.currentBlockIndex = index;
+  block.status = "active";
+  if(block.type === "work") startFocusSession(block.missionId);
+  else startBreak();
+  scheduleBlockReminder(block);
+  saveState();
+  renderApp();
+}
+
+// Ends whatever block is currently active (logging real elapsed time via
+// the existing session/break mechanisms either way) and moves to the next
+// block in the plan, or finishes the plan if that was the last one.
+function completeCurrentBlockAndAdvance(){
+  const plan = STATE.dayPlan;
+  if(!plan) return;
+  const block = plan.blocks[plan.currentBlockIndex];
+  if(!block) return;
+  if(block.reminderId){ cancelPushReminder(block.reminderId); block.reminderId = null; }
+  block.status = "done";
+  if(block.type === "work") pauseFocusSession({ silent: true });
+  else endBreak();
+
+  const nextIndex = plan.currentBlockIndex + 1;
+  if(plan.blocks[nextIndex]){
+    startPlanBlock(nextIndex);
+  }else{
+    plan.currentBlockIndex = -1;
+    saveState();
+    showToast("Today's plan is complete 🎉");
+    renderApp();
+  }
+}
+
+// Stops the plan altogether without advancing — the active block still
+// gets its real time logged, it just doesn't roll into the next one.
+function stopDayPlan(){
+  const plan = STATE.dayPlan;
+  if(!plan) return;
+  const block = plan.blocks[plan.currentBlockIndex];
+  if(block){
+    if(block.reminderId){ cancelPushReminder(block.reminderId); block.reminderId = null; }
+    block.status = "done";
+    if(block.type === "work") pauseFocusSession({ silent: true });
+    else endBreak();
+  }
+  plan.currentBlockIndex = -1;
+  saveState();
+  renderApp();
+}
+
+/* ==========================================================================
+   SECTION: FLOATING FOCUS WIDGET (Document Picture-in-Picture)
+   A real always-on-top window — stays visible over other apps (a video
+   editor, anything) the same way a video call's floating self-view does,
+   because it uses the same browser API. Chrome/Edge desktop only; the
+   pop-out button simply doesn't render elsewhere (see pipSupported()).
+   The returned window is controllable directly from here — no need to
+   inject a separate script into it, since we hold a live reference.
+   ========================================================================== */
+let focusPipWindow = null;
+
+function pipSupported(){
+  return "documentPictureInPicture" in window;
+}
+
+async function openFocusPipWidget(){
+  if(!pipSupported()){ showToast("Floating widget isn't supported in this browser — Chrome or Edge desktop only"); return; }
+  if(focusPipWindow && !focusPipWindow.closed){ focusPipWindow.focus(); return; }
+
+  try{
+    focusPipWindow = await documentPictureInPicture.requestWindow({ width: 320, height: 190 });
+  }catch(err){
+    showToast("Couldn't open the floating widget");
+    return;
+  }
+
+  const style = focusPipWindow.document.createElement("style");
+  style.textContent = `
+    body{ margin:0; background:#121212; color:#fff; font-family: -apple-system, system-ui, sans-serif; padding:16px; box-sizing:border-box; }
+    .pip-eyebrow{ font-size:11px; color:#A0A0A0; text-transform:uppercase; letter-spacing:0.06em; font-weight:600; }
+    .pip-title{ font-size:16px; font-weight:700; margin:4px 0 12px; line-height:1.3; }
+    .pip-timer{ font-family: "SF Mono", ui-monospace, monospace; font-size:30px; font-weight:700; color:#ED8D01; margin-bottom:14px; }
+    .pip-actions{ display:flex; gap:8px; }
+    button{ flex:1; padding:9px; border-radius:8px; border:none; font-weight:600; font-size:13px; cursor:pointer; }
+    .pip-primary{ background:#ED8D01; color:#121212; }
+    .pip-ghost{ background:#242424; color:#fff; }
+  `;
+  focusPipWindow.document.head.appendChild(style);
+  focusPipWindow.document.body.innerHTML = `
+    <div class="pip-eyebrow" id="pipEyebrow">FOUNDER OS</div>
+    <div class="pip-title" id="pipTitle">No active session</div>
+    <div class="pip-timer" id="pipTimer">00:00:00</div>
+    <div class="pip-actions">
+      <button class="pip-ghost" id="pipStopBtn">Stop</button>
+      <button class="pip-primary" id="pipDoneBtn">Done</button>
+    </div>
+  `;
+
+  const render = () => {
+    if(!focusPipWindow || focusPipWindow.closed) return;
+    const eyebrowEl = focusPipWindow.document.getElementById("pipEyebrow");
+    const titleEl = focusPipWindow.document.getElementById("pipTitle");
+    const timerEl = focusPipWindow.document.getElementById("pipTimer");
+    if(!titleEl) return; // window closing mid-tick
+
+    let startedAt = null;
+    if(STATE.focusSession){
+      const mission = STATE.missions.find(m => m.id === STATE.focusSession.missionId);
+      eyebrowEl.textContent = "FOCUS";
+      titleEl.textContent = mission ? mission.title : "Focus session";
+      startedAt = STATE.focusSession.startedAt;
+    }else if(STATE.activeBreak){
+      eyebrowEl.textContent = "BREAK";
+      titleEl.textContent = "Recovery break";
+      startedAt = STATE.activeBreak.startedAt;
+    }else{
+      eyebrowEl.textContent = "FOUNDER OS";
+      titleEl.textContent = "No active session";
+    }
+    if(startedAt){
+      const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+      const h = String(Math.floor(elapsed / 3600)).padStart(2, "0");
+      const m = String(Math.floor((elapsed % 3600) / 60)).padStart(2, "0");
+      const s = String(elapsed % 60).padStart(2, "0");
+      timerEl.textContent = `${h}:${m}:${s}`;
+    }else{
+      timerEl.textContent = "00:00:00";
+    }
+  };
+  const intervalId = setInterval(render, 1000);
+  render();
+
+  const doneAction = () => {
+    if(STATE.dayPlan && STATE.dayPlan.currentBlockIndex >= 0) completeCurrentBlockAndAdvance();
+    else if(STATE.activeBreak) endBreak();
+    else pauseFocusSession();
+    renderApp();
+  };
+  const stopAction = () => {
+    if(STATE.dayPlan && STATE.dayPlan.currentBlockIndex >= 0) stopDayPlan();
+    else if(STATE.activeBreak) endBreak();
+    else pauseFocusSession();
+    renderApp();
+  };
+  focusPipWindow.document.getElementById("pipDoneBtn").addEventListener("click", doneAction);
+  focusPipWindow.document.getElementById("pipStopBtn").addEventListener("click", stopAction);
+  focusPipWindow.addEventListener("pagehide", () => { clearInterval(intervalId); focusPipWindow = null; });
 }
 
 function startFocusSession(missionId){
@@ -4739,6 +5013,67 @@ function maybeShowQuickCaptureOverlay(){
   overlay.querySelector("#qcOpenApp").addEventListener("click", () => overlay.remove());
 }
 
+// Shown when opened via the home screen / taskbar "Start Focus Session"
+// shortcut (manifest.json shortcuts -> ?startfocus=1). Two dropdowns —
+// business, then mission — rather than a three-level business/project/
+// mission cascade: missions already show which business they belong to,
+// and one fewer tap to actually get into focus mode is worth more than
+// the extra precision most of the time.
+function maybeShowQuickFocusOverlay(){
+  const params = new URLSearchParams(window.location.search);
+  if(params.get("startfocus") !== "1") return;
+  history.replaceState({}, "", window.location.pathname);
+  openQuickFocusPickerModal();
+}
+
+function openQuickFocusPickerModal(){
+  const businesses = STATE.businesses;
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">Start a focus session</div>
+      <button class="modal-close" data-modal-close>${icon("close")}</button>
+    </div>
+    <div class="field">
+      <label class="field-label">Business</label>
+      <select class="field-select" id="qfBusiness">
+        <option value="">Choose a business…</option>
+        ${businesses.map(b => `<option value="${b.id}">${escapeHtml(b.name)}</option>`).join("")}
+      </select>
+    </div>
+    <div class="field">
+      <label class="field-label">Mission</label>
+      <select class="field-select" id="qfMission" disabled><option value="">Pick a business first…</option></select>
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
+      <button type="button" class="btn btn-primary" id="qfStartBtn" disabled>${icon("play")} Start</button>
+    </div>
+  `, (root) => {
+    const bizSelect = root.querySelector("#qfBusiness");
+    const missionSelect = root.querySelector("#qfMission");
+    const startBtn = root.querySelector("#qfStartBtn");
+    bizSelect.addEventListener("change", () => {
+      const missions = STATE.missions.filter(m => m.status === "active" && m.businessId === bizSelect.value);
+      missionSelect.innerHTML = missions.length
+        ? `<option value="">Choose a mission…</option>` + missions.map(m => `<option value="${m.id}">${escapeHtml(m.title)}</option>`).join("")
+        : `<option value="">No active missions for this business</option>`;
+      missionSelect.disabled = missions.length === 0;
+      startBtn.disabled = true;
+    });
+    missionSelect.addEventListener("change", () => { startBtn.disabled = !missionSelect.value; });
+    startBtn.addEventListener("click", () => {
+      const missionId = missionSelect.value;
+      if(!missionId) return;
+      closeModal();
+      startFocusSession(missionId);
+      STATE.ui.currentView = "focus";
+      saveState();
+      renderApp();
+    });
+  });
+  renderApp();
+}
+
 /* ==========================================================================
    SECTION: PUSH NOTIFICATIONS
    Real server-sent push (see worker.js + PUSH_KV), not just in-page
@@ -5804,8 +6139,16 @@ function openMissionModal(mission, presetProjectId, presetTitle, onCreated){
    session is active — the latter bypasses the sidebar/topbar entirely.
    -------------------------------------------------------------------------- */
 function renderFocusPicker(){
+  const plan = STATE.dayPlan && STATE.dayPlan.date === todayDateString() ? STATE.dayPlan : null;
+  const planSection = plan ? renderDayPlanBlocks(plan) : `
+    <div class="card glass col-12">
+      <h3 class="card-title"><span class="card-icon">${icon("focus")}</span>Today's plan</h3>
+      ${emptyState("focus", "No plan generated yet", "Auto-fill today from your active missions — each block sized to how much time that task actually needs, with real breaks built in between.")}
+      <button class="btn btn-primary" data-action="generate-day-plan" style="width:100%;margin-top:var(--space-3);">${icon("play")} Generate today's plan</button>
+    </div>`;
+
   const activeMissions = STATE.missions.filter(m => m.status === "active").sort((a,b) => b.impactScore - a.impactScore);
-  const rows = activeMissions.map(m => {
+  const quickRows = activeMissions.map(m => {
     const biz = businessById(m.businessId);
     return `
     <div class="mission-row">
@@ -5817,16 +6160,70 @@ function renderFocusPicker(){
           <span class="tag tag-time">${formatMinutes(missionRemainingMinutes(m))} left</span>
         </div>
       </div>
-      <button class="btn btn-primary btn-sm" data-action="start-mission" data-id="${m.id}">${icon("play")} Start</button>
+      <button class="btn btn-ghost btn-sm" data-action="start-mission" data-id="${m.id}">${icon("play")} Quick start</button>
     </div>`;
   }).join("");
 
   return `
   <div class="view-enter">
-    <div class="card glass col-12">
-      <h3 class="card-title"><span class="card-icon">${icon("focus")}</span>Pick a mission to enter Focus Mode</h3>
-      ${rows || emptyState("focus", "No active missions to focus on", "Queue a mission first, then come back here to start a distraction-free session.")}
+    ${planSection}
+    <div class="card glass col-12" style="margin-top:var(--space-4);">
+      <h3 class="card-title"><span class="card-icon">${icon("play")}</span>Or jump into any mission right now</h3>
+      ${quickRows || emptyState("focus", "No active missions", "Queue a mission first, then come back here to start a distraction-free session.")}
     </div>
+  </div>`;
+}
+
+// Renders the generated plan itself — past blocks marked done, the
+// current block live-timed with its own controls, everything after shown
+// as upcoming. A break block shown here (rather than in the fullscreen
+// shell) is deliberate: unlike a work session, a break doesn't need to be
+// distraction-free, so the normal shell is the right place for it.
+function renderDayPlanBlocks(plan){
+  const rows = plan.blocks.map((block, i) => {
+    const isCurrent = i === plan.currentBlockIndex;
+    const mission = block.missionId ? STATE.missions.find(m => m.id === block.missionId) : null;
+    const biz = mission ? businessById(mission.businessId) : null;
+    const label = block.type === "work" ? (mission ? mission.title : "(mission no longer exists)") : "Break";
+    const rowIcon = block.type === "work" ? icon("target") : icon("battery");
+
+    let action;
+    if(isCurrent && block.type === "break"){
+      const startedAt = STATE.activeBreak ? STATE.activeBreak.startedAt : Date.now();
+      action = `
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div class="focus-timer" data-live-timer="${startedAt}" style="font-size:16px;">00:00:00</div>
+          <button class="btn btn-primary btn-sm" data-action="advance-day-plan">${icon("check")} Done</button>
+          <button class="btn btn-ghost btn-sm" data-action="stop-day-plan">Stop</button>
+        </div>`;
+    }else if(isCurrent){
+      action = `<span class="tag tag-time">In progress — see fullscreen</span>`;
+    }else if(block.status === "done"){
+      action = `<span class="tag tag-neutral-dim">${icon("check")} Done</span>`;
+    }else if(plan.currentBlockIndex === -1){
+      action = `<button class="btn btn-ghost btn-sm" data-action="start-plan-block" data-index="${i}">${icon("play")} Start</button>`;
+    }else{
+      action = `<span class="tag tag-time">Up next</span>`;
+    }
+
+    return `
+    <div class="mission-row ${isCurrent ? "mission-row-active" : ""}">
+      <div class="mission-main">
+        <div class="mission-title">${rowIcon} ${escapeHtml(label)}</div>
+        <div class="mission-meta">
+          ${biz ? `<span class="tag tag-biz">${escapeHtml(biz.name)}</span>` : ""}
+          <span class="tag tag-time">${formatMinutes(block.plannedMinutes)}</span>
+        </div>
+      </div>
+      ${action}
+    </div>`;
+  }).join("");
+
+  return `
+  <div class="card glass col-12">
+    <h3 class="card-title"><span class="card-icon">${icon("focus")}</span>Today's plan</h3>
+    ${rows}
+    <button class="btn btn-ghost btn-sm" data-action="generate-day-plan" style="width:100%;margin-top:var(--space-3);">${icon("refresh")} Regenerate plan</button>
   </div>`;
 }
 
@@ -5845,9 +6242,14 @@ function renderFocusModeFullscreen(){
   const biz = businessById(mission.businessId);
   const remainingCfg = escapeHtml(JSON.stringify({ startedAt: session.startedAt, estimatedMinutes: mission.estimatedMinutes, timeSpentMinutes: mission.timeSpentMinutes }));
 
+  const plan = STATE.dayPlan;
+  const currentBlock = plan && plan.currentBlockIndex >= 0 ? plan.blocks[plan.currentBlockIndex] : null;
+  const isPlanBlock = currentBlock && currentBlock.type === "work" && currentBlock.missionId === mission.id;
+
   return `
   <div class="focus-shell">
     <button class="focus-exit" data-action="exit-focus-mode">${icon("close")} Exit fullscreen</button>
+    ${pipSupported() ? `<button class="focus-exit" style="right:170px;" data-action="pop-out-focus-widget">${icon("popout")} Pop out</button>` : ""}
     <div class="focus-shell-inner">
       <div class="focus-shell-eyebrow">${escapeHtml(biz.name)} · CURRENT MISSION</div>
       <div class="focus-shell-mission">${escapeHtml(mission.title)}</div>
@@ -5867,8 +6269,11 @@ function renderFocusModeFullscreen(){
       </div>
 
       <div class="focus-shell-actions">
-        <button class="btn btn-ghost" data-action="stop-focus">${icon("focus")} Pause</button>
-        <button class="btn btn-primary" data-action="complete-mission">${icon("check")} Complete Mission</button>
+        ${isPlanBlock
+          ? `<button class="btn btn-ghost" data-action="stop-day-plan">Stop plan</button>
+             <button class="btn btn-primary" data-action="advance-day-plan">${icon("check")} Block done — take a break</button>`
+          : `<button class="btn btn-ghost" data-action="stop-focus">${icon("focus")} Pause</button>
+             <button class="btn btn-primary" data-action="complete-mission">${icon("check")} Complete Mission</button>`}
       </div>
     </div>
   </div>`;
@@ -7491,6 +7896,32 @@ function renderSettings(){
       </div>
 
       <div class="card glass col-12">
+        <h3 class="card-title"><span class="card-icon">${icon("focus")}</span>Focus &amp; Break Scheduling</h3>
+        <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);">
+          Controls how "Generate today's plan" fills out your day — how long a work block runs by default, how long breaks are, the most a single block can run before it's split up, and the total amount of the day it'll schedule.
+        </div>
+        <form id="focusSettingsForm" class="field-row" style="flex-wrap:wrap;">
+          <div class="field" style="min-width:140px;">
+            <label class="field-label">Default work block</label>
+            <input class="field-input" type="number" min="15" step="15" name="workBlockMinutes" value="${STATE.focusSettings.workBlockMinutes}" /> <span style="font-size:12px;color:var(--text-tertiary);">minutes</span>
+          </div>
+          <div class="field" style="min-width:140px;">
+            <label class="field-label">Break length</label>
+            <input class="field-input" type="number" min="5" step="5" name="breakMinutes" value="${STATE.focusSettings.breakMinutes}" /> <span style="font-size:12px;color:var(--text-tertiary);">minutes</span>
+          </div>
+          <div class="field" style="min-width:140px;">
+            <label class="field-label">Max block length</label>
+            <input class="field-input" type="number" min="30" step="15" name="maxWorkBlockMinutes" value="${STATE.focusSettings.maxWorkBlockMinutes}" /> <span style="font-size:12px;color:var(--text-tertiary);">minutes</span>
+          </div>
+          <div class="field" style="min-width:140px;">
+            <label class="field-label">Plan up to</label>
+            <input class="field-input" type="number" min="60" step="30" name="totalPlanMinutes" value="${STATE.focusSettings.totalPlanMinutes}" /> <span style="font-size:12px;color:var(--text-tertiary);">minutes/day</span>
+          </div>
+          <div style="width:100%;"><button type="submit" class="btn btn-primary btn-sm">Save</button></div>
+        </form>
+      </div>
+
+      <div class="card glass col-12">
         <h3 class="card-title" style="color: var(--red)">Danger Zone</h3>
         <div class="danger-zone" style="display:flex; align-items:center; justify-content:space-between; gap: var(--space-4); flex-wrap: wrap;">
           <div>
@@ -8220,6 +8651,37 @@ function bindEvents(){
     });
   }
 
+  const generatePlanBtn = document.querySelector('[data-action="generate-day-plan"]');
+  if(generatePlanBtn){
+    generatePlanBtn.addEventListener("click", () => {
+      generateDayPlan();
+      showToast("Today's plan is ready");
+      renderApp();
+    });
+  }
+  document.querySelectorAll('[data-action="start-plan-block"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      startPlanBlock(Number(btn.getAttribute("data-index")));
+      STATE.ui.currentView = "focus";
+      saveState();
+      renderApp();
+    });
+  });
+  const advancePlanBtn = document.querySelector('[data-action="advance-day-plan"]');
+  if(advancePlanBtn){
+    advancePlanBtn.addEventListener("click", () => {
+      completeCurrentBlockAndAdvance();
+      showToast("On to the next block");
+    });
+  }
+  const stopPlanBtn = document.querySelector('[data-action="stop-day-plan"]');
+  if(stopPlanBtn){
+    stopPlanBtn.addEventListener("click", () => {
+      stopDayPlan();
+      showToast("Plan stopped");
+    });
+  }
+
   const motionToggle = document.querySelector('[data-action="toggle-motion"]');
   if(motionToggle){
     motionToggle.addEventListener("click", () => {
@@ -8322,6 +8784,22 @@ function bindEvents(){
   if(disablePushBtn) disablePushBtn.addEventListener("click", async () => { await disablePushNotifications(); renderApp(); });
   const testPushBtn = document.querySelector('[data-action="send-test-push"]');
   if(testPushBtn) testPushBtn.addEventListener("click", sendTestPushNotification);
+
+  const focusSettingsForm = document.getElementById("focusSettingsForm");
+  if(focusSettingsForm){
+    focusSettingsForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      STATE.focusSettings = {
+        workBlockMinutes: Math.max(15, Number(fd.get("workBlockMinutes")) || 120),
+        breakMinutes: Math.max(5, Number(fd.get("breakMinutes")) || 15),
+        maxWorkBlockMinutes: Math.max(30, Number(fd.get("maxWorkBlockMinutes")) || 240),
+        totalPlanMinutes: Math.max(60, Number(fd.get("totalPlanMinutes")) || 480),
+      };
+      saveState();
+      showToast("Focus settings saved — regenerate today's plan to apply them");
+    });
+  }
 
   const syncDriveBtn = document.querySelector('[data-action="sync-drive-now"]');
   if(syncDriveBtn){
@@ -9013,6 +9491,27 @@ function bindFocusModeShellEvents(){
       showToast("Mission completed — nice work");
     });
   }
+  const advancePlanBtn = document.querySelector('[data-action="advance-day-plan"]');
+  if(advancePlanBtn){
+    advancePlanBtn.addEventListener("click", () => {
+      completeCurrentBlockAndAdvance();
+      showToast("Block done — on to the next one");
+    });
+  }
+  const stopPlanBtn = document.querySelector('[data-action="stop-day-plan"]');
+  if(stopPlanBtn){
+    stopPlanBtn.addEventListener("click", () => {
+      stopDayPlan();
+      STATE.ui.currentView = "focus";
+      saveState();
+      renderApp();
+      showToast("Plan stopped");
+    });
+  }
+  const popOutBtn = document.querySelector('[data-action="pop-out-focus-widget"]');
+  if(popOutBtn){
+    popOutBtn.addEventListener("click", () => openFocusPipWidget());
+  }
   document.querySelectorAll('[data-action="toggle-task"]').forEach(el => {
     el.addEventListener("click", () => {
       toggleTask(el.getAttribute("data-mission"), el.getAttribute("data-task"));
@@ -9227,6 +9726,7 @@ function initApp(){
         navigator.serviceWorker.register("./sw.js").catch(() => {}); // safe no-op if it fails (e.g. unsupported browser)
       }
       maybeShowQuickCaptureOverlay();
+      maybeShowQuickFocusOverlay();
     }).catch(renderFatalError);
   }catch(err){
     renderFatalError(err);

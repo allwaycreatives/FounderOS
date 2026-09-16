@@ -19,6 +19,13 @@
       "description": "Jump straight to voice capture",
       "url": "./?capture=1",
       "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Start Focus Session",
+      "short_name": "Focus",
+      "description": "Pick a business and mission, then go",
+      "url": "./?startfocus=1",
+      "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }]
     }
   ]
 }
