@@ -1376,7 +1376,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 27,
+  SCHEMA_VERSION: 28,
   APP_NAME: "Founder OS",
   // Matches VAPID_PUBLIC_KEY in worker.js exactly — this half isn't
   // secret (only the private key, held server-side, needs to be), so
@@ -2057,6 +2057,10 @@ function getDefaultState(){
     neglectSettings: {
       thresholdDays: 5, // a business/project with no linked activity for this many days shows up in the notification bell
     },
+    notificationSettings: {
+      soundsEnabled: true, // distinct synthesized tone per notification category
+      voiceEnabled: false, // spoken announcement via the browser's speech synthesis — off by default, since a talking computer can be a surprise the first time
+    },
     opportunities: [],    // pipeline: Idea -> ... -> Completed
     goals: [],             // SMART goals — see GoalModel
     ideas: [],            // Idea Vault inbox
@@ -2445,6 +2449,13 @@ function migrateState(state){
   if(state.schemaVersion < 27){
     if(state.goals === undefined) state.goals = [];
     state.schemaVersion = 27;
+  }
+  // v27 -> v28: notification sounds + voice announcements.
+  if(state.schemaVersion < 28){
+    if(state.notificationSettings === undefined){
+      state.notificationSettings = { soundsEnabled: true, voiceEnabled: false };
+    }
+    state.schemaVersion = 28;
   }
   return state;
 }
@@ -3009,7 +3020,7 @@ async function scheduleBlockReminder(block){
     : "Back to it whenever you're ready.";
   const id = await schedulePushReminder({
     dueAt: Date.now() + block.plannedMinutes * 60000,
-    title, body, tag: "focus-block", url: "./",
+    title, body, tag: "focus-block", url: "./", category: "timeup",
   });
   block.reminderId = id;
   saveState();
@@ -3129,6 +3140,7 @@ function getNeglectedItems(){
 }
 
 let notificationPanelOpen = false;
+let neglectAnnouncedThisSession = false; // fires the neglect chime once per page load, not once per render
 function toggleNotificationPanel(){
   notificationPanelOpen = !notificationPanelOpen;
   renderApp();
@@ -5275,6 +5287,103 @@ function openQuickFocusPickerModal(){
 }
 
 /* ==========================================================================
+   SECTION: NOTIFICATION SOUNDS + VOICE ANNOUNCEMENTS
+   Distinct synthesized tones per category — no audio files, no build step,
+   generated on the fly with Web Audio oscillators — plus an optional
+   spoken line via the browser's built-in speech synthesis. Both are
+   togglable in Settings (sounds default on, voice defaults off since a
+   talking computer can be a surprise the first time). Both are genuinely
+   best-effort: a browser blocking autoplay audio before any click, or one
+   with no speechSynthesis support, just silently skips rather than
+   surfacing an error over a missed chime.
+   ========================================================================== */
+let notificationAudioCtx = null;
+function getNotificationAudioContext(){
+  if(!notificationAudioCtx) notificationAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if(notificationAudioCtx.state === "suspended") notificationAudioCtx.resume();
+  return notificationAudioCtx;
+}
+function playTone(freq, startTime, duration, ctx, gainPeak, type){
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = type || "sine";
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0, startTime);
+  gain.gain.linearRampToValueAtTime(gainPeak || 0.15, startTime + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(startTime);
+  osc.stop(startTime + duration + 0.05);
+}
+// Each category gets its own small melodic shape, not just one generic
+// beep — the point is recognizing which kind of nudge just happened
+// without even reading it. [frequency, offset seconds, duration seconds]
+const NOTIFICATION_SOUND_PATTERNS = {
+  ontrack:  [[660, 0, 0.12], [880, 0.10, 0.18]],                     // cheerful upward two-note
+  complete: [[523, 0, 0.10], [659, 0.09, 0.10], [784, 0.18, 0.22]],  // triumphant three-note rise
+  timeup:   [[740, 0, 0.15], [740, 0.22, 0.15]],                      // even double-beep — alert, not harsh
+  neglect:  [[392, 0, 0.20], [330, 0.18, 0.28]],                      // soft downward two-note — a nudge, not an alarm
+  absence:  [[440, 0, 0.16], [370, 0.15, 0.16], [440, 0.30, 0.20]],   // a little "ahem" shape
+  generic:  [[600, 0, 0.15]],
+};
+function playNotificationSound(category){
+  if(!STATE.notificationSettings.soundsEnabled) return;
+  try{
+    const ctx = getNotificationAudioContext();
+    const pattern = NOTIFICATION_SOUND_PATTERNS[category] || NOTIFICATION_SOUND_PATTERNS.generic;
+    const now = ctx.currentTime;
+    pattern.forEach(([freq, offset, duration]) => playTone(freq, now + offset, duration, ctx));
+  }catch(e){ /* autoplay blocked or Web Audio unavailable — a missed sound isn't worth surfacing an error over */ }
+}
+const NOTIFICATION_VOICE_LINES = {
+  ontrack: "You're on track. Nice work.",
+  complete: "Done. Nice work.",
+  timeup: "Hey. Time's up. What's next?",
+  neglect: "Hey — you've been neglecting this one for a while.",
+  absence: "Hey, you haven't been in Founder OS in a while.",
+  generic: "",
+};
+function speakNotification(category, customText){
+  if(!STATE.notificationSettings.voiceEnabled) return;
+  if(!("speechSynthesis" in window)) return;
+  const text = customText || NOTIFICATION_VOICE_LINES[category] || "";
+  if(!text) return;
+  try{
+    window.speechSynthesis.cancel(); // don't let announcements stack/overlap
+    const utter = new SpeechSynthesisUtterance(text);
+    window.speechSynthesis.speak(utter);
+  }catch(e){ /* TTS unavailable — silently skip */ }
+}
+// The one function everything else should call — sound and voice
+// together, each independently toggle-able under the hood.
+function fireNotification(category, customVoiceText){
+  playNotificationSound(category);
+  speakNotification(category, customVoiceText);
+}
+
+// "Hey, you haven't been in Founder OS in a while" — reschedules on every
+// app open by cancelling whatever was pending from last time and setting
+// a fresh one N hours out. If the app is opened again before that fires,
+// it just gets cancelled and rescheduled again, so the nudge only ever
+// actually arrives after a genuine gap. The pending reminder's id lives
+// in localStorage, not synced state — it's meaningless on any other
+// device, same reasoning as deviceId itself.
+const ABSENCE_REMINDER_HOURS = 48;
+async function scheduleAbsenceReminder(){
+  if(!pushSubscriptionActive()) return;
+  const existingId = localStorage.getItem("founderos.absenceReminderId");
+  if(existingId) cancelPushReminder(existingId);
+  const id = await schedulePushReminder({
+    dueAt: Date.now() + ABSENCE_REMINDER_HOURS * 60 * 60 * 1000,
+    title: "Founder OS",
+    body: "You haven't been in here in a couple of days — worth a check-in?",
+    tag: "absence", url: "./", category: "absence",
+  });
+  if(id) localStorage.setItem("founderos.absenceReminderId", id);
+  else localStorage.removeItem("founderos.absenceReminderId");
+}
+
+/* ==========================================================================
    SECTION: PUSH NOTIFICATIONS
    Real server-sent push (see worker.js + PUSH_KV), not just in-page
    reminders — these fire even if the app hasn't been opened in hours,
@@ -5377,13 +5486,13 @@ async function sendTestPushNotification(){
 // later via cancelPushReminder if the session ends early. Fails silently
 // (returns null) if push isn't enabled — callers should treat reminders as
 // a bonus, never a requirement for the feature they're attached to.
-async function schedulePushReminder({ dueAt, title, body, tag, url }){
+async function schedulePushReminder({ dueAt, title, body, tag, url, category }){
   if(!pushSubscriptionActive()) return null;
   try{
     const resp = await fetch("/api/push/schedule", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceId: getDeviceId(), dueAt, title, body, tag, url }),
+      body: JSON.stringify({ deviceId: getDeviceId(), dueAt, title, body, tag, url, category }),
     });
     if(!resp.ok) return null;
     const data = await resp.json().catch(() => null);
@@ -8306,6 +8415,27 @@ function renderSettings(){
       </div>
 
       <div class="card glass col-12">
+        <h3 class="card-title"><span class="card-icon">${icon("bell")}</span>Notification Sounds &amp; Voice</h3>
+        <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);">
+          Each kind of nudge gets its own distinct chime — on track, complete, time's up, neglect, haven't been in a while. Voice reads it out loud too, on top of the chime. Both only fully work while the app is open somewhere; a fully-closed app falls back to your device's plain notification sound.
+        </div>
+        <div class="settings-section">
+          <div class="settings-row">
+            <div><div class="settings-row-label">Notification sounds</div><div class="settings-row-desc">Distinct tone per notification type</div></div>
+            <div class="toggle ${STATE.notificationSettings.soundsEnabled ? "on" : ""}" data-action="toggle-sounds-enabled"><div class="toggle-knob"></div></div>
+          </div>
+          <div class="settings-row">
+            <div><div class="settings-row-label">Voice announcements</div><div class="settings-row-desc">Speaks the notification out loud</div></div>
+            <div class="toggle ${STATE.notificationSettings.voiceEnabled ? "on" : ""}" data-action="toggle-voice-enabled"><div class="toggle-knob"></div></div>
+          </div>
+          <div class="settings-row">
+            <div><div class="settings-row-label">Try it</div><div class="settings-row-desc">Hear what "time's up" sounds like</div></div>
+            <button class="btn btn-ghost btn-sm" data-action="test-notification-sound">${icon("bell")} Test</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card glass col-12">
         <h3 class="card-title" style="color: var(--red)">Danger Zone</h3>
         <div class="danger-zone" style="display:flex; align-items:center; justify-content:space-between; gap: var(--space-4); flex-wrap: wrap;">
           <div>
@@ -8829,6 +8959,13 @@ function renderTopbar(){
   const now = new Date();
   const dateStr = now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
   const neglected = getNeglectedItems();
+  // Once per loaded session, not once per render — renderTopbar can fire
+  // many times as state changes, and nobody wants the neglect chime going
+  // off repeatedly just because they clicked something unrelated.
+  if(neglected.length && !neglectAnnouncedThisSession){
+    neglectAnnouncedThisSession = true;
+    fireNotification("neglect");
+  }
   return `
   <header class="topbar">
     <div class="topbar-left">
@@ -9076,6 +9213,7 @@ function bindEvents(){
   if(advancePlanBtn){
     advancePlanBtn.addEventListener("click", () => {
       completeCurrentBlockAndAdvance();
+      fireNotification("complete");
       showToast("On to the next block");
     });
   }
@@ -9094,6 +9232,39 @@ function bindEvents(){
       document.documentElement.style.setProperty("--transition", STATE.ui.reducedMotionPref ? "0.001ms" : "220ms cubic-bezier(.4,0,.2,1)");
       saveState();
       renderApp();
+    });
+  }
+
+  const soundsToggle = document.querySelector('[data-action="toggle-sounds-enabled"]');
+  if(soundsToggle){
+    soundsToggle.addEventListener("click", () => {
+      STATE.notificationSettings.soundsEnabled = !STATE.notificationSettings.soundsEnabled;
+      saveState();
+      if(STATE.notificationSettings.soundsEnabled) playNotificationSound("ontrack"); // immediate feedback that it's on
+      renderApp();
+    });
+  }
+  const voiceToggle = document.querySelector('[data-action="toggle-voice-enabled"]');
+  if(voiceToggle){
+    voiceToggle.addEventListener("click", () => {
+      STATE.notificationSettings.voiceEnabled = !STATE.notificationSettings.voiceEnabled;
+      saveState();
+      if(STATE.notificationSettings.voiceEnabled) speakNotification("ontrack", "Voice announcements are on.");
+      renderApp();
+    });
+  }
+  const testSoundBtn = document.querySelector('[data-action="test-notification-sound"]');
+  if(testSoundBtn){
+    testSoundBtn.addEventListener("click", () => {
+      // Briefly force both on for the test regardless of current settings,
+      // so "Test" always actually demonstrates something.
+      const prevSounds = STATE.notificationSettings.soundsEnabled;
+      const prevVoice = STATE.notificationSettings.voiceEnabled;
+      STATE.notificationSettings.soundsEnabled = true;
+      STATE.notificationSettings.voiceEnabled = true;
+      fireNotification("timeup");
+      STATE.notificationSettings.soundsEnabled = prevSounds;
+      STATE.notificationSettings.voiceEnabled = prevVoice;
     });
   }
 
@@ -9440,6 +9611,7 @@ function bindGoalEvents(){
   document.querySelectorAll('[data-action="complete-goal"]').forEach(btn => {
     btn.addEventListener("click", () => {
       completeGoal(btn.getAttribute("data-id"));
+      fireNotification("complete");
       showToast("Goal completed 🎉");
       renderApp();
     });
@@ -9454,6 +9626,7 @@ function bindGoalEvents(){
     btn.addEventListener("click", () => {
       const done = btn.getAttribute("data-done") === "true";
       checkInGoal(btn.getAttribute("data-id"), done);
+      fireNotification(done ? "ontrack" : "neglect");
       showToast(done ? "Nice — logged" : "Logged — tomorrow's a fresh shot");
       renderApp();
     });
@@ -9942,6 +10115,7 @@ function bindFocusModeShellEvents(){
   if(completeBtn){
     completeBtn.addEventListener("click", () => {
       completeMissionFromFocus();
+      fireNotification("complete");
       STATE.ui.currentView = "dashboard";
       saveState();
       renderApp();
@@ -9952,6 +10126,7 @@ function bindFocusModeShellEvents(){
   if(advancePlanBtn){
     advancePlanBtn.addEventListener("click", () => {
       completeCurrentBlockAndAdvance();
+      fireNotification("complete");
       showToast("Block done — on to the next one");
     });
   }
@@ -10181,7 +10356,14 @@ function initApp(){
       // sw.js's own header comment for what it actually does day-to-day.
       if("serviceWorker" in navigator){
         navigator.serviceWorker.register("./sw.js").catch(() => {}); // safe no-op if it fails (e.g. unsupported browser)
+        // The rich sound + voice announcement only works while the page is
+        // alive somewhere — see sw.js's own comment on why a fully-closed
+        // app can only get the OS's generic notification sound instead.
+        navigator.serviceWorker.addEventListener("message", (event) => {
+          if(event.data && event.data.type === "founderos-push") fireNotification(event.data.category);
+        });
       }
+      scheduleAbsenceReminder();
       maybeShowQuickCaptureOverlay();
       maybeShowQuickFocusOverlay();
     }).catch(renderFatalError);

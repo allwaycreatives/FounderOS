@@ -51,24 +51,38 @@ self.addEventListener("fetch", (event) => {
 });
 
 /* --------------------------------------------------------------------------
-   PUSH NOTIFICATIONS (focus/break session reminders)
+   PUSH NOTIFICATIONS (focus/break session reminders, neglect nudges, etc.)
    The Worker (see worker.js) sends an encrypted push message; this is what
    actually turns it into something the person sees. `tag` lets a newer
    reminder replace an older still-showing one (e.g. session status
    updates) instead of piling up notifications.
+
+   `category` (e.g. "timeup", "neglect", "ontrack", "complete") travels
+   with the payload so the OPEN APP can play its own custom sound + voice
+   announcement instead of just the OS's generic notification sound — see
+   the postMessage broadcast below. A service worker has no Web Audio or
+   speech synthesis access of its own (no window, nothing to play through),
+   so when the app is fully closed, the person gets the plain OS
+   notification sound only — the rich sound/voice needs the page alive
+   somewhere to actually produce it.
    -------------------------------------------------------------------------- */
 self.addEventListener("push", (event) => {
-  let data = { title: "Founder OS", body: "", url: "./" };
+  let data = { title: "Founder OS", body: "", url: "./", category: "generic" };
   try{ if(event.data) data = Object.assign(data, event.data.json()); }catch(e){ /* malformed payload — fall back to the generic default above */ }
 
   event.waitUntil(
-    self.registration.showNotification(data.title, {
-      body: data.body,
-      icon: "./icons/icon-192.png",
-      badge: "./icons/icon-192.png",
-      tag: data.tag || undefined,
-      data: { url: data.url || "./" },
-    })
+    Promise.all([
+      self.registration.showNotification(data.title, {
+        body: data.body,
+        icon: "./icons/icon-192.png",
+        badge: "./icons/icon-192.png",
+        tag: data.tag || undefined,
+        data: { url: data.url || "./" },
+      }),
+      self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
+        clientList.forEach((client) => client.postMessage({ type: "founderos-push", category: data.category, title: data.title, body: data.body }));
+      }),
+    ])
   );
 });
 

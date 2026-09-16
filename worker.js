@@ -108,6 +108,7 @@ async function handlePushSchedule(request, env) {
     body: body.body || "",
     tag: body.tag || undefined,
     url: body.url || "./",
+    category: body.category || "generic",
   }), { expirationTtl: ttlSeconds });
   return json({ ok: true, id });
 }
@@ -131,7 +132,7 @@ async function handlePushTest(request, env) {
   if (!subRaw) return json({ error: "No push subscription found for this device yet — enable notifications first." }, 404);
   const subscription = JSON.parse(subRaw);
   try {
-    const resp = await sendWebPush(subscription, { title: "Founder OS", body: "Test notification — if you see this, push is working.", url: "./" }, env);
+    const resp = await sendWebPush(subscription, { title: "Founder OS", body: "Test notification — if you see this, push is working.", url: "./", category: "ontrack" }, env);
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");
       return json({ error: `Push service rejected the message (${resp.status}): ${text}` }, 502);
@@ -166,7 +167,7 @@ async function runDueReminders(env) {
     const subscription = JSON.parse(subRaw);
     try {
       const resp = await sendWebPush(subscription, {
-        title: reminder.title, body: reminder.body, url: reminder.url, tag: reminder.tag,
+        title: reminder.title, body: reminder.body, url: reminder.url, tag: reminder.tag, category: reminder.category,
       }, env);
       if (resp.status === 404 || resp.status === 410) {
         // Push service says this subscription is gone for good — stop
