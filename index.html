@@ -1376,7 +1376,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 28,
+  SCHEMA_VERSION: 29,
   APP_NAME: "Founder OS",
   // Matches VAPID_PUBLIC_KEY in worker.js exactly — this half isn't
   // secret (only the private key, held server-side, needs to be), so
@@ -2031,6 +2031,7 @@ function defaultUiState(){
     notesPinnedOnly: false,
     notesTypeFilter: "all", // all | meeting | personal
     emailSelectedContactId: null,
+    emailActiveAccountId: null, // null = the main Google connection; otherwise an id from integrations.emailAccounts
     knowledgeFilter: "",
     knowledgeFilterCategory: "all",
   };
@@ -2080,6 +2081,12 @@ function getDefaultState(){
     integrations: {
       google: { clientId: "", connected: false, accountEmail: "", refreshToken: null },
       microsoft: { clientId: "", tenantId: "common", connected: false, accountEmail: "" },
+      // Deliberately separate from `google` above — these are additional
+      // Gmail-only connections (gmail.readonly/gmail.send scope only, no
+      // Drive/Calendar access) for sending/reading from other addresses.
+      // Connecting, disconnecting, or a token going stale here NEVER
+      // touches the main google connection Drive sync and Calendar rely on.
+      emailAccounts: [], // [{ id, email, refreshToken, connected }]
       // Cross-device sync: one JSON file in the connected Google account's
       // hidden app-data space (not visible in the person's regular Drive).
       // fileId is discovered by filename on first sync from any device, then
@@ -2462,6 +2469,12 @@ function migrateState(state){
       state.notificationSettings = { soundsEnabled: true, voiceEnabled: false };
     }
     state.schemaVersion = 28;
+  }
+  // v28 -> v29: multiple email accounts, kept entirely separate from the
+  // main Google connection Drive sync/Calendar rely on.
+  if(state.schemaVersion < 29){
+    if(state.integrations.emailAccounts === undefined) state.integrations.emailAccounts = [];
+    state.schemaVersion = 29;
   }
   return state;
 }
@@ -3896,6 +3909,34 @@ async function connectGoogleCalendar(){
   });
   window.location.href = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
 }
+
+// A second, independent OAuth flow for "connect another email account" —
+// deliberately Gmail-only scope (no Drive/Calendar), and deliberately
+// forces Google's account picker (select_account) so this can be a
+// genuinely different Google account than whichever one is signed into
+// the browser or already connected as the main account above.
+const EMAIL_ACCOUNT_SCOPE = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email";
+async function connectEmailAccount(){
+  const { codeVerifier, codeChallenge } = await generatePkcePair();
+  sessionStorage.setItem("founderos.google.pkceVerifier", codeVerifier);
+  sessionStorage.setItem("founderos.google.pkceFlow", "email_account");
+  const params = new URLSearchParams({
+    client_id: CONFIG.GOOGLE_CLIENT_ID,
+    redirect_uri: googleRedirectUri(),
+    response_type: "code",
+    scope: EMAIL_ACCOUNT_SCOPE,
+    access_type: "offline",
+    prompt: "consent select_account",
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
+  });
+  window.location.href = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+}
+function disconnectEmailAccount(id){
+  STATE.integrations.emailAccounts = STATE.integrations.emailAccounts.filter(a => a.id !== id);
+  saveState();
+}
+
 // Runs once on every app load — checks whether the URL contains a Google
 // auth redirect (?code=...) and, if so, completes the exchange. This is the
 // "callback" now that sign-in is a full-page redirect instead of a popup.
@@ -3908,7 +3949,9 @@ async function handleGoogleRedirectIfPresent(){
   window.history.replaceState({}, "", window.location.pathname);
 
   const codeVerifier = sessionStorage.getItem("founderos.google.pkceVerifier");
+  const flow = sessionStorage.getItem("founderos.google.pkceFlow") || "main";
   sessionStorage.removeItem("founderos.google.pkceVerifier");
+  sessionStorage.removeItem("founderos.google.pkceFlow");
   if(!codeVerifier){ showToast("Google sign-in couldn't complete — try connecting again"); return; }
 
   try{
@@ -3924,23 +3967,50 @@ async function handleGoogleRedirectIfPresent(){
     const data = await resp.json();
     if(!resp.ok || data.error) throw new Error(data.error_description || data.error || `Token exchange failed (${resp.status})`);
 
-    CALSYNC.google.accessToken = data.access_token;
-    CALSYNC.google.expiresAt = Date.now() + (Number(data.expires_in) || 3500) * 1000;
-    if(data.refresh_token) STATE.integrations.google.refreshToken = data.refresh_token; // Google only sends this on first consent — don't overwrite with nothing on later re-auths
+    if(flow === "email_account"){
+      await completeEmailAccountConnect(data);
+    }else{
+      CALSYNC.google.accessToken = data.access_token;
+      CALSYNC.google.expiresAt = Date.now() + (Number(data.expires_in) || 3500) * 1000;
+      if(data.refresh_token) STATE.integrations.google.refreshToken = data.refresh_token; // Google only sends this on first consent — don't overwrite with nothing on later re-auths
 
-    const info = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
-      headers: { Authorization: `Bearer ${data.access_token}` },
-    }).then(r => r.json()).catch(() => ({}));
-    STATE.integrations.google.connected = true;
-    STATE.integrations.google.accountEmail = info.email || STATE.integrations.google.accountEmail || "";
-    saveState();
-    showToast(`Connected Google (${STATE.integrations.google.accountEmail || "unknown account"})`);
-    await handlePostConnectSync();
+      const info = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+        headers: { Authorization: `Bearer ${data.access_token}` },
+      }).then(r => r.json()).catch(() => ({}));
+      STATE.integrations.google.connected = true;
+      STATE.integrations.google.accountEmail = info.email || STATE.integrations.google.accountEmail || "";
+      saveState();
+      showToast(`Connected Google (${STATE.integrations.google.accountEmail || "unknown account"})`);
+      await handlePostConnectSync();
+    }
   }catch(err){
     showToast(`Google sign-in failed: ${err.message || err}`);
   }
   renderApp();
 }
+
+// Adds (or refreshes the token for) an additional Gmail-only account —
+// completely separate from the main google integration above, by design.
+async function completeEmailAccountConnect(data){
+  if(!data.refresh_token){
+    showToast("Didn't get lasting access — try disconnecting Founder OS at myaccount.google.com/permissions first, then reconnect");
+    return;
+  }
+  const info = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+    headers: { Authorization: `Bearer ${data.access_token}` },
+  }).then(r => r.json()).catch(() => ({}));
+  const email = info.email || "unknown account";
+  const existing = STATE.integrations.emailAccounts.find(a => a.email === email);
+  if(existing){
+    existing.refreshToken = data.refresh_token;
+    existing.connected = true;
+  }else{
+    STATE.integrations.emailAccounts.push({ id: makeId("emailacct"), email, refreshToken: data.refresh_token, connected: true });
+  }
+  saveState();
+  showToast(`Added ${email} for email`);
+}
+
 // Shared by both entry points (Settings > Connect, and the Welcome screen's
 // "Restore your console" path). On a genuinely fresh device (onboarding not
 // yet complete), a successful sync that actually finds real records skips
@@ -3998,6 +4068,25 @@ async function getGoogleAccessToken(){
   if(!resp.ok || data.error) throw new Error(data.error_description || data.error || `Token refresh failed (${resp.status})`);
   CALSYNC.google.accessToken = data.access_token;
   CALSYNC.google.expiresAt = Date.now() + (Number(data.expires_in) || 3500) * 1000;
+  return data.access_token;
+}
+
+// Separate access-token cache for additional email accounts, keyed by
+// refresh token rather than a single shared slot — this is what lets
+// several accounts hold independently-valid tokens at once without ever
+// touching CALSYNC.google (the main account's cache) above.
+const emailAccountTokenCache = {};
+async function getAccessTokenForRefreshToken(refreshToken){
+  const cached = emailAccountTokenCache[refreshToken];
+  if(cached && Date.now() < cached.expiresAt - 30000) return cached.accessToken;
+  const resp = await fetch("/api/google/refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refreshToken, clientId: CONFIG.GOOGLE_CLIENT_ID }),
+  });
+  const data = await resp.json();
+  if(!resp.ok || data.error) throw new Error(data.error_description || data.error || `Token refresh failed (${resp.status})`);
+  emailAccountTokenCache[refreshToken] = { accessToken: data.access_token, expiresAt: Date.now() + (Number(data.expires_in) || 3500) * 1000 };
   return data.access_token;
 }
 async function listGoogleEvents(timeMinISO, timeMaxISO){
@@ -4316,8 +4405,11 @@ async function driveUploadState(fileId, dataObj){
    needed for this at all.
    ========================================================================== */
 const GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
-async function gmailApiFetch(url, options){
-  const token = await getGoogleAccessToken();
+// refreshToken is optional — omit it to use the main Google connection
+// (unchanged default behavior); pass one of STATE.integrations.
+// emailAccounts[].refreshToken to act as that additional account instead.
+async function gmailApiFetch(url, options, refreshToken){
+  const token = refreshToken ? await getAccessTokenForRefreshToken(refreshToken) : await getGoogleAccessToken();
   const headers = Object.assign({ Authorization: `Bearer ${token}` }, (options && options.headers) || {});
   return fetch(url, Object.assign({}, options, { headers }));
 }
@@ -4325,16 +4417,16 @@ async function gmailApiFetch(url, options){
 // Finds messages to/from a given address, newest first, with enough
 // detail for a conversation list (subject, sender, date, and Gmail's own
 // auto-generated snippet) without fetching each message's full body.
-async function fetchGmailThreadForContact(email){
+async function fetchGmailThreadForContact(email, refreshToken){
   const q = encodeURIComponent(`from:${email} OR to:${email}`);
-  const listRes = await gmailApiFetch(`${GMAIL_API_BASE}/messages?q=${q}&maxResults=25`);
+  const listRes = await gmailApiFetch(`${GMAIL_API_BASE}/messages?q=${q}&maxResults=25`, undefined, refreshToken);
   if(!listRes.ok) throw new Error(`Gmail search failed (${listRes.status})`);
   const listData = await listRes.json();
   const ids = (listData.messages || []).map(m => m.id);
   if(!ids.length) return [];
 
   const messages = await Promise.all(ids.map(async (id) => {
-    const res = await gmailApiFetch(`${GMAIL_API_BASE}/messages/${id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Date`);
+    const res = await gmailApiFetch(`${GMAIL_API_BASE}/messages/${id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Date`, undefined, refreshToken);
     if(!res.ok) return null;
     const data = await res.json();
     const headers = {};
@@ -4355,14 +4447,14 @@ async function fetchGmailThreadForContact(email){
 // Builds a proper RFC 2822 message and sends it for real via Gmail's API
 // — this is an actual send, not a mailto: link. Plain text only for now;
 // no HTML composing or attachments in this first pass.
-async function sendGmailMessage({ to, subject, body }){
+async function sendGmailMessage({ to, subject, body, refreshToken }){
   const fromLine = `To: ${to}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n${body}`;
   const raw = btoa(unescape(encodeURIComponent(fromLine))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const res = await gmailApiFetch(`${GMAIL_API_BASE}/messages/send`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ raw }),
-  });
+  }, refreshToken);
   if(!res.ok){
     const errData = await res.json().catch(() => ({}));
     throw new Error((errData.error && errData.error.message) || `Send failed (${res.status})`);
@@ -7388,16 +7480,24 @@ function openFollowUpModal(contact){
    variable holding whatever was last fetched, thrown away on refresh.
    Real sends, not mailto: links — see sendGmailMessage above.
    -------------------------------------------------------------------------- */
-let emailThreadCache = {}; // contactId -> { loading, messages, error }
+let emailThreadCache = {}; // "contactId::accountKey" -> { loading, messages, error }
+function emailAccountKey(accountId){ return accountId || "main"; }
+function resolveEmailAccount(accountId){
+  if(!accountId) return { label: STATE.integrations.google.accountEmail ? `Main (${STATE.integrations.google.accountEmail})` : "Main account", refreshToken: undefined, connected: STATE.integrations.google.connected };
+  const acct = STATE.integrations.emailAccounts.find(a => a.id === accountId);
+  return acct ? { label: acct.email, refreshToken: acct.refreshToken, connected: acct.connected } : { label: "Unknown account", refreshToken: undefined, connected: false };
+}
 
-async function loadEmailThread(contact){
-  emailThreadCache[contact.id] = { loading: true, messages: [], error: null };
+async function loadEmailThread(contact, accountId){
+  const cacheKey = `${contact.id}::${emailAccountKey(accountId)}`;
+  emailThreadCache[cacheKey] = { loading: true, messages: [], error: null };
   renderApp();
   try{
-    const messages = await fetchGmailThreadForContact(contact.email);
-    emailThreadCache[contact.id] = { loading: false, messages, error: null };
+    const { refreshToken } = resolveEmailAccount(accountId);
+    const messages = await fetchGmailThreadForContact(contact.email, refreshToken);
+    emailThreadCache[cacheKey] = { loading: false, messages, error: null };
   }catch(err){
-    emailThreadCache[contact.id] = { loading: false, messages: [], error: err.message || String(err) };
+    emailThreadCache[cacheKey] = { loading: false, messages: [], error: err.message || String(err) };
   }
   renderApp();
 }
@@ -7406,7 +7506,13 @@ function renderEmail(){
   const contactsWithEmail = STATE.contacts.filter(c => c.email && c.email.trim());
   const selectedId = STATE.ui.emailSelectedContactId;
   const selectedContact = selectedId ? STATE.contacts.find(c => c.id === selectedId) : null;
-  const googleConnected = STATE.integrations.google.connected;
+  const activeAccountId = STATE.ui.emailActiveAccountId;
+  const activeAccount = resolveEmailAccount(activeAccountId);
+
+  const accountOptions = [
+    `<option value="" ${!activeAccountId ? "selected" : ""}>${STATE.integrations.google.connected ? `Main (${escapeHtml(STATE.integrations.google.accountEmail || "connected")})` : "Main (not connected)"}</option>`,
+    ...STATE.integrations.emailAccounts.map(a => `<option value="${a.id}" ${activeAccountId === a.id ? "selected" : ""}>${escapeHtml(a.email)}</option>`),
+  ].join("");
 
   const list = contactsWithEmail.map(c => `
     <div class="mission-row card-clickable ${selectedId === c.id ? "mission-row-active" : ""}" data-action="select-email-contact" data-id="${c.id}" style="cursor:pointer;">
@@ -7417,14 +7523,15 @@ function renderEmail(){
     </div>`).join("");
 
   let threadPane;
-  if(!googleConnected){
-    threadPane = `<div class="card glass">${emptyState("mail", "Connect Google first", "Email needs your Google account connected in Settings, with Gmail permission granted — reconnect there if you connected before this feature existed.")}</div>`;
+  if(!activeAccount.connected){
+    threadPane = `<div class="card glass">${emptyState("mail", "This account isn't connected", "Connect it in Settings > Email Accounts, or switch to another account above.")}</div>`;
   }else if(!selectedContact){
     threadPane = `<div class="card glass">${emptyState("mail", "Pick a contact", "Choose someone on the left to see your real email conversation with them.")}</div>`;
   }else{
-    const cache = emailThreadCache[selectedContact.id];
+    const cacheKey = `${selectedContact.id}::${emailAccountKey(activeAccountId)}`;
+    const cache = emailThreadCache[cacheKey];
     if(!cache){
-      loadEmailThread(selectedContact); // fires once, re-renders itself when done
+      loadEmailThread(selectedContact, activeAccountId); // fires once, re-renders itself when done
       threadPane = `<div class="card glass"><div style="padding:24px;text-align:center;color:var(--text-tertiary);">Loading conversation…</div></div>`;
     }else if(cache.loading){
       threadPane = `<div class="card glass"><div style="padding:24px;text-align:center;color:var(--text-tertiary);">Loading conversation…</div></div>`;
@@ -7447,29 +7554,45 @@ function renderEmail(){
   }
 
   return `
-  <div class="view-enter" style="display:grid;grid-template-columns:280px 1fr;gap:var(--space-4);align-items:start;">
-    <div class="card glass" style="max-height:70vh;overflow-y:auto;">
-      <h3 class="card-title">${icon("mail")} Contacts</h3>
-      ${list || emptyState("mail", "No email addresses yet", "Add an email to a contact to start tracking conversations.")}
+  <div class="view-enter">
+    <div class="toolbar">
+      <div class="toolbar-filters">
+        <label class="field-label" style="margin:0;">Account</label>
+        <select class="field-select" id="emailAccountSelect">${accountOptions}</select>
+      </div>
+      <button class="btn btn-ghost btn-sm" data-action="add-email-account">${icon("plus")} Add another account</button>
     </div>
-    <div>
-      ${selectedContact ? `
-        <div class="toolbar">
-          <div style="font-weight:700;font-size:14px;">${escapeHtml(selectedContact.name)} <span style="font-weight:400;color:var(--text-tertiary);font-size:12.5px;">${escapeHtml(selectedContact.email)}</span></div>
-          <button class="btn btn-primary btn-sm" data-action="compose-email" data-id="${selectedContact.id}">${icon("send")} Compose</button>
-        </div>` : ""}
-      ${threadPane}
+    <div style="display:grid;grid-template-columns:280px 1fr;gap:var(--space-4);align-items:start;">
+      <div class="card glass" style="max-height:70vh;overflow-y:auto;">
+        <h3 class="card-title">${icon("mail")} Contacts</h3>
+        ${list || emptyState("mail", "No email addresses yet", "Add an email to a contact to start tracking conversations.")}
+      </div>
+      <div>
+        ${selectedContact ? `
+          <div class="toolbar">
+            <div style="font-weight:700;font-size:14px;">${escapeHtml(selectedContact.name)} <span style="font-weight:400;color:var(--text-tertiary);font-size:12.5px;">${escapeHtml(selectedContact.email)}</span></div>
+            <button class="btn btn-primary btn-sm" data-action="compose-email" data-id="${selectedContact.id}">${icon("send")} Compose</button>
+          </div>
+          <div style="font-size:11.5px;color:var(--text-tertiary);margin:-6px 0 10px;">Sending as ${escapeHtml(activeAccount.label)}</div>` : ""}
+        ${threadPane}
+      </div>
     </div>
   </div>`;
 }
 
 function openComposeEmailModal(contact){
+  const activeAccountId = STATE.ui.emailActiveAccountId;
+  const activeAccount = resolveEmailAccount(activeAccountId);
   openModal(`
     <div class="modal-header">
       <div class="modal-title">Email ${escapeHtml(contact.name)}</div>
       <button class="modal-close" data-modal-close>${icon("close")}</button>
     </div>
     <form id="composeEmailForm">
+      <div class="field">
+        <label class="field-label">From</label>
+        <input class="field-input" value="${escapeHtml(activeAccount.label)}" disabled style="opacity:0.7;" />
+      </div>
       <div class="field">
         <label class="field-label">To</label>
         <input class="field-input" value="${escapeHtml(contact.email)}" disabled style="opacity:0.7;" />
@@ -7495,11 +7618,11 @@ function openComposeEmailModal(contact){
       sendBtn.disabled = true;
       sendBtn.textContent = "Sending…";
       try{
-        await sendGmailMessage({ to: contact.email, subject: fd.get("subject"), body: fd.get("body") });
+        await sendGmailMessage({ to: contact.email, subject: fd.get("subject"), body: fd.get("body"), refreshToken: activeAccount.refreshToken });
         closeModal();
         showToast(`Email sent to ${contact.name}`);
         fireNotification("complete");
-        delete emailThreadCache[contact.id]; // force a fresh reload so the sent message shows up
+        delete emailThreadCache[`${contact.id}::${emailAccountKey(activeAccountId)}`]; // force a fresh reload so the sent message shows up
         renderApp();
       }catch(err){
         sendBtn.disabled = false;
@@ -8556,6 +8679,24 @@ function renderSettings(){
       </div>
 
       <div class="card glass col-12">
+        <h3 class="card-title"><span class="card-icon">${icon("mail")}</span>Email Accounts</h3>
+        <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);">
+          Additional Gmail accounts for sending/reading email, on top of the main Google connection above. Fully independent — connecting or disconnecting one here never touches Drive sync or Calendar, which stay on the main account.
+        </div>
+        <div class="settings-section">
+          ${STATE.integrations.emailAccounts.length ? STATE.integrations.emailAccounts.map(a => `
+            <div class="settings-row">
+              <div><div class="settings-row-label">${escapeHtml(a.email)}</div><div class="settings-row-desc">${a.connected ? "Connected" : "Needs reconnecting"}</div></div>
+              <button class="btn btn-ghost btn-sm" data-action="disconnect-email-account" data-id="${a.id}">Disconnect</button>
+            </div>`).join("") : `<div class="settings-row-desc" style="padding:8px 0;">No additional accounts yet — the main Google connection above still works fine for email on its own.</div>`}
+          <div class="settings-row" style="border-top:${STATE.integrations.emailAccounts.length ? "1px solid var(--panel-border)" : "none"};">
+            <div><div class="settings-row-label">Add another account</div><div class="settings-row-desc">Opens Google's account picker so you can choose a different account than the main one</div></div>
+            <button class="btn btn-primary btn-sm" data-action="add-email-account">${icon("plus")} Connect</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card glass col-12">
         <h3 class="card-title"><span class="card-icon">${icon("bell")}</span>Push Notifications</h3>
         <div style="font-size:13px;color:var(--text-secondary);margin-bottom:var(--space-4);">
           Real notifications sent from the server — these arrive even if this device hasn't had Founder OS open in hours. Per-device: enabling this on your phone doesn't enable it on your laptop, and vice versa. Used for focus/break session reminders and check-ins.
@@ -9555,6 +9696,16 @@ function bindEvents(){
   const disconnectMsBtn = document.querySelector('[data-action="disconnect-microsoft"]');
   if(disconnectMsBtn) disconnectMsBtn.addEventListener("click", disconnectMicrosoftCalendar);
 
+  document.querySelectorAll('[data-action="disconnect-email-account"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      disconnectEmailAccount(btn.getAttribute("data-id"));
+      renderApp();
+      showToast("Email account disconnected");
+    });
+  });
+  const addEmailAccountSettingsBtn = document.querySelector('[data-action="add-email-account"]');
+  if(addEmailAccountSettingsBtn) addEmailAccountSettingsBtn.addEventListener("click", () => connectEmailAccount());
+
   const enablePushBtn = document.querySelector('[data-action="enable-push"]');
   if(enablePushBtn) enablePushBtn.addEventListener("click", async () => { await enablePushNotifications(); renderApp(); });
   const disablePushBtn = document.querySelector('[data-action="disable-push"]');
@@ -9846,7 +9997,8 @@ function bindEmailEvents(){
   });
   document.querySelectorAll('[data-action="retry-email-thread"]').forEach(btn => {
     btn.addEventListener("click", () => {
-      delete emailThreadCache[btn.getAttribute("data-id")];
+      const key = `${btn.getAttribute("data-id")}::${emailAccountKey(STATE.ui.emailActiveAccountId)}`;
+      delete emailThreadCache[key];
       renderApp();
     });
   });
@@ -9856,6 +10008,16 @@ function bindEmailEvents(){
       if(contact) openComposeEmailModal(contact);
     });
   });
+  const emailAccountSelect = document.getElementById("emailAccountSelect");
+  if(emailAccountSelect){
+    emailAccountSelect.addEventListener("change", () => {
+      STATE.ui.emailActiveAccountId = emailAccountSelect.value || null;
+      saveState();
+      renderApp();
+    });
+  }
+  const addEmailAccountBtn = document.querySelector('[data-action="add-email-account"]');
+  if(addEmailAccountBtn) addEmailAccountBtn.addEventListener("click", () => connectEmailAccount());
 }
 
 /* ---- Recovery bindings ---- */
