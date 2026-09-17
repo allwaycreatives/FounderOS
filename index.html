@@ -1395,7 +1395,7 @@ const CONFIG = {
   // Client IDs from your own Google Cloud / Azure app registrations.
   GOOGLE_GIS_SRC: "https://accounts.google.com/gsi/client", // no longer used — Google Calendar/Drive sign-in moved to a plain redirect (Authorization Code + PKCE) so a refresh token could be persisted; left here only in case GIS is needed again for something else later
   MSAL_SRC: "https://alcdn.msauth.net/browser/3.7.1/js/msal-browser.min.js", // verify latest at https://www.npmjs.com/package/@azure/msal-browser before relying on this pin
-  GOOGLE_SCOPE: "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive.appdata",
+  GOOGLE_SCOPE: "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
   // Not a secret — OAuth Client IDs for browser-based apps are meant to be
   // public (visible in every request the browser makes anyway). Baked in
   // here so nobody using this app ever has to find or paste it in — that's
@@ -1437,6 +1437,7 @@ const NAV_ITEMS = [
   { id: "focus",         label: "Focus",         icon: "focus",    built: true  },
   { id: "opportunities", label: "Opportunities", icon: "pipeline", built: true  },
   { id: "contacts",      label: "Contacts",      icon: "users",    built: true  },
+  { id: "email",         label: "Email",         icon: "mail",     built: true  },
   { id: "ideavault",     label: "Idea Vault",    icon: "bulb",     built: true  },
   { id: "journal",       label: "Journal",       icon: "book",     built: true  },
   { id: "notes",         label: "Notes",         icon: "note",     built: true  },
@@ -1498,6 +1499,9 @@ const TOUR_CONTENT = {
   contacts: [
     { title: "Contacts", blurb: "The people behind the businesses — partners, clients, collaborators — with a memory of your history together, not just a name and an email." },
   ],
+  email: [
+    { title: "Real Email", blurb: "Your actual Gmail conversation with each contact, and real sends from right here — not a mailto: link, an actual message through your connected Google account." },
+  ],
   ideavault: [
     { title: "Idea Vault", blurb: "Capture a stray idea in seconds without derailing whatever you're focused on right now — sort and act on it later." },
   ],
@@ -1556,6 +1560,7 @@ const ICONS = {
   search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>',
   help: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 0 1 5.82 1c0 2-3 2-3 4"/><path d="M12 17h.01"/></svg>',
   send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m3 3 18 9-18 9 4-9-4-9Z"/></svg>',
+  mail: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m2 6 10 7 10-7"/></svg>',
   users: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
   note: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 3h13l3 3v15H4Z"/><path d="M17 3v4h4M8 12h8M8 16h5"/></svg>',
   pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 17v5M8 3h8l-1 7 3 3H6l3-3-1-7Z"/></svg>',
@@ -2025,6 +2030,7 @@ function defaultUiState(){
     notesFilter: "", // simple text filter
     notesPinnedOnly: false,
     notesTypeFilter: "all", // all | meeting | personal
+    emailSelectedContactId: null,
     knowledgeFilter: "",
     knowledgeFilterCategory: "all",
   };
@@ -4297,6 +4303,71 @@ async function driveUploadState(fileId, dataObj){
     body: JSON.stringify(dataObj),
   });
   if(!res.ok) throw new Error(`Drive upload failed (${res.status})`);
+}
+
+/* ==========================================================================
+   SECTION: EMAIL (Gmail — read + send, tied to Contacts)
+   Same reasoning as Calendar Sync and Drive above: nothing about emails is
+   cached in STATE, ever. Every thread is fetched live from Gmail each time
+   a contact's conversation is opened, using the SAME access-token/refresh
+   machinery already built for Drive (getGoogleAccessToken/driveApiFetch's
+   pattern) — Gmail's API supports direct browser calls with a bearer
+   token exactly like Drive/Calendar do, so no new Worker endpoint was
+   needed for this at all.
+   ========================================================================== */
+const GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
+async function gmailApiFetch(url, options){
+  const token = await getGoogleAccessToken();
+  const headers = Object.assign({ Authorization: `Bearer ${token}` }, (options && options.headers) || {});
+  return fetch(url, Object.assign({}, options, { headers }));
+}
+
+// Finds messages to/from a given address, newest first, with enough
+// detail for a conversation list (subject, sender, date, and Gmail's own
+// auto-generated snippet) without fetching each message's full body.
+async function fetchGmailThreadForContact(email){
+  const q = encodeURIComponent(`from:${email} OR to:${email}`);
+  const listRes = await gmailApiFetch(`${GMAIL_API_BASE}/messages?q=${q}&maxResults=25`);
+  if(!listRes.ok) throw new Error(`Gmail search failed (${listRes.status})`);
+  const listData = await listRes.json();
+  const ids = (listData.messages || []).map(m => m.id);
+  if(!ids.length) return [];
+
+  const messages = await Promise.all(ids.map(async (id) => {
+    const res = await gmailApiFetch(`${GMAIL_API_BASE}/messages/${id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Date`);
+    if(!res.ok) return null;
+    const data = await res.json();
+    const headers = {};
+    (data.payload && data.payload.headers || []).forEach(h => { headers[h.name] = h.value; });
+    return {
+      id: data.id,
+      threadId: data.threadId,
+      subject: headers.Subject || "(no subject)",
+      from: headers.From || "",
+      to: headers.To || "",
+      date: headers.Date ? new Date(headers.Date).getTime() : Number(data.internalDate) || 0,
+      snippet: data.snippet || "",
+    };
+  }));
+  return messages.filter(Boolean).sort((a, b) => b.date - a.date);
+}
+
+// Builds a proper RFC 2822 message and sends it for real via Gmail's API
+// — this is an actual send, not a mailto: link. Plain text only for now;
+// no HTML composing or attachments in this first pass.
+async function sendGmailMessage({ to, subject, body }){
+  const fromLine = `To: ${to}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n${body}`;
+  const raw = btoa(unescape(encodeURIComponent(fromLine))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const res = await gmailApiFetch(`${GMAIL_API_BASE}/messages/send`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ raw }),
+  });
+  if(!res.ok){
+    const errData = await res.json().catch(() => ({}));
+    throw new Error((errData.error && errData.error.message) || `Send failed (${res.status})`);
+  }
+  return res.json();
 }
 
 function buildSyncPayload(state){
@@ -7311,6 +7382,135 @@ function openFollowUpModal(contact){
 }
 
 /* --------------------------------------------------------------------------
+   EMAIL (Gmail — read + send, tied to Contacts)
+   Same "never cache remote data" principle as Calendar Sync: nothing about
+   a thread lives in STATE, ever — emailThreadCache is a plain module
+   variable holding whatever was last fetched, thrown away on refresh.
+   Real sends, not mailto: links — see sendGmailMessage above.
+   -------------------------------------------------------------------------- */
+let emailThreadCache = {}; // contactId -> { loading, messages, error }
+
+async function loadEmailThread(contact){
+  emailThreadCache[contact.id] = { loading: true, messages: [], error: null };
+  renderApp();
+  try{
+    const messages = await fetchGmailThreadForContact(contact.email);
+    emailThreadCache[contact.id] = { loading: false, messages, error: null };
+  }catch(err){
+    emailThreadCache[contact.id] = { loading: false, messages: [], error: err.message || String(err) };
+  }
+  renderApp();
+}
+
+function renderEmail(){
+  const contactsWithEmail = STATE.contacts.filter(c => c.email && c.email.trim());
+  const selectedId = STATE.ui.emailSelectedContactId;
+  const selectedContact = selectedId ? STATE.contacts.find(c => c.id === selectedId) : null;
+  const googleConnected = STATE.integrations.google.connected;
+
+  const list = contactsWithEmail.map(c => `
+    <div class="mission-row card-clickable ${selectedId === c.id ? "mission-row-active" : ""}" data-action="select-email-contact" data-id="${c.id}" style="cursor:pointer;">
+      <div class="mission-main">
+        <div class="mission-title" style="font-size:13.5px;">${escapeHtml(c.name)}</div>
+        <div class="opportunity-notes">${escapeHtml(c.email)}</div>
+      </div>
+    </div>`).join("");
+
+  let threadPane;
+  if(!googleConnected){
+    threadPane = `<div class="card glass">${emptyState("mail", "Connect Google first", "Email needs your Google account connected in Settings, with Gmail permission granted — reconnect there if you connected before this feature existed.")}</div>`;
+  }else if(!selectedContact){
+    threadPane = `<div class="card glass">${emptyState("mail", "Pick a contact", "Choose someone on the left to see your real email conversation with them.")}</div>`;
+  }else{
+    const cache = emailThreadCache[selectedContact.id];
+    if(!cache){
+      loadEmailThread(selectedContact); // fires once, re-renders itself when done
+      threadPane = `<div class="card glass"><div style="padding:24px;text-align:center;color:var(--text-tertiary);">Loading conversation…</div></div>`;
+    }else if(cache.loading){
+      threadPane = `<div class="card glass"><div style="padding:24px;text-align:center;color:var(--text-tertiary);">Loading conversation…</div></div>`;
+    }else if(cache.error){
+      threadPane = `<div class="card glass"><div style="padding:24px;color:var(--text-tertiary);">Couldn't load: ${escapeHtml(cache.error)}</div><button class="btn btn-ghost btn-sm" data-action="retry-email-thread" data-id="${selectedContact.id}" style="margin-top:10px;">Retry</button></div>`;
+    }else{
+      const messages = cache.messages;
+      threadPane = `
+        <div class="card glass" style="max-height:60vh;overflow-y:auto;">
+          ${messages.length ? messages.map(m => `
+            <div class="notif-row" style="align-items:flex-start;">
+              <div style="flex:1;min-width:0;">
+                <div class="notif-row-title">${icon("mail")} ${escapeHtml(m.subject)}</div>
+                <div class="notif-row-desc">${escapeHtml(m.from)} · ${new Date(m.date).toLocaleString()}</div>
+                <div class="opportunity-notes" style="margin-top:6px;">${escapeHtml(m.snippet)}</div>
+              </div>
+            </div>`).join("") : `<div style="padding:24px;text-align:center;color:var(--text-tertiary);">No emails found with ${escapeHtml(selectedContact.email)} yet.</div>`}
+        </div>`;
+    }
+  }
+
+  return `
+  <div class="view-enter" style="display:grid;grid-template-columns:280px 1fr;gap:var(--space-4);align-items:start;">
+    <div class="card glass" style="max-height:70vh;overflow-y:auto;">
+      <h3 class="card-title">${icon("mail")} Contacts</h3>
+      ${list || emptyState("mail", "No email addresses yet", "Add an email to a contact to start tracking conversations.")}
+    </div>
+    <div>
+      ${selectedContact ? `
+        <div class="toolbar">
+          <div style="font-weight:700;font-size:14px;">${escapeHtml(selectedContact.name)} <span style="font-weight:400;color:var(--text-tertiary);font-size:12.5px;">${escapeHtml(selectedContact.email)}</span></div>
+          <button class="btn btn-primary btn-sm" data-action="compose-email" data-id="${selectedContact.id}">${icon("send")} Compose</button>
+        </div>` : ""}
+      ${threadPane}
+    </div>
+  </div>`;
+}
+
+function openComposeEmailModal(contact){
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">Email ${escapeHtml(contact.name)}</div>
+      <button class="modal-close" data-modal-close>${icon("close")}</button>
+    </div>
+    <form id="composeEmailForm">
+      <div class="field">
+        <label class="field-label">To</label>
+        <input class="field-input" value="${escapeHtml(contact.email)}" disabled style="opacity:0.7;" />
+      </div>
+      <div class="field">
+        <label class="field-label">Subject</label>
+        <input class="field-input" name="subject" required placeholder="Subject" />
+      </div>
+      <div class="field">
+        <label class="field-label">Message</label>
+        <textarea class="field-textarea" name="body" required style="min-height:160px;" placeholder="Write your message…"></textarea>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
+        <button type="submit" class="btn btn-primary" id="sendEmailBtn">${icon("send")} Send</button>
+      </div>
+    </form>
+  `, (root) => {
+    root.querySelector("#composeEmailForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const sendBtn = root.querySelector("#sendEmailBtn");
+      sendBtn.disabled = true;
+      sendBtn.textContent = "Sending…";
+      try{
+        await sendGmailMessage({ to: contact.email, subject: fd.get("subject"), body: fd.get("body") });
+        closeModal();
+        showToast(`Email sent to ${contact.name}`);
+        fireNotification("complete");
+        delete emailThreadCache[contact.id]; // force a fresh reload so the sent message shows up
+        renderApp();
+      }catch(err){
+        sendBtn.disabled = false;
+        sendBtn.innerHTML = `${icon("send")} Send`;
+        showToast(`Send failed: ${err.message || err}`);
+      }
+    });
+  });
+}
+
+/* --------------------------------------------------------------------------
    IDEA VAULT
    -------------------------------------------------------------------------- */
 function renderIdeaVault(){
@@ -8468,6 +8668,7 @@ const VIEW_RENDERERS = {
   focus: renderFocusPicker,
   opportunities: renderOpportunities,
   contacts: renderContacts,
+  email: renderEmail,
   ideavault: renderIdeaVault,
   journal: renderJournal,
   notes: renderNotes,
@@ -9422,6 +9623,7 @@ function bindEvents(){
   bindAssistantEvents();
   bindMissionEvents();
   bindGoalEvents();
+  bindEmailEvents();
   bindRecoveryEvents();
   bindOpportunityEvents();
   bindIdeaVaultEvents();
@@ -9629,6 +9831,29 @@ function bindGoalEvents(){
       fireNotification(done ? "ontrack" : "neglect");
       showToast(done ? "Nice — logged" : "Logged — tomorrow's a fresh shot");
       renderApp();
+    });
+  });
+}
+
+/* ---- Email bindings ---- */
+function bindEmailEvents(){
+  document.querySelectorAll('[data-action="select-email-contact"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      STATE.ui.emailSelectedContactId = btn.getAttribute("data-id");
+      saveState();
+      renderApp();
+    });
+  });
+  document.querySelectorAll('[data-action="retry-email-thread"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      delete emailThreadCache[btn.getAttribute("data-id")];
+      renderApp();
+    });
+  });
+  document.querySelectorAll('[data-action="compose-email"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      const contact = STATE.contacts.find(c => c.id === btn.getAttribute("data-id"));
+      if(contact) openComposeEmailModal(contact);
     });
   });
 }
