@@ -1427,7 +1427,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 29,
+  SCHEMA_VERSION: 30,
   APP_NAME: "Founder OS",
   // Matches VAPID_PUBLIC_KEY in worker.js exactly — this half isn't
   // secret (only the private key, held server-side, needs to be), so
@@ -2132,6 +2132,7 @@ function getDefaultState(){
     notificationSettings: {
       soundsEnabled: true, // distinct synthesized tone per notification category
       voiceEnabled: false, // spoken announcement via the browser's speech synthesis — off by default, since a talking computer can be a surprise the first time
+      voiceName: null, // specific voice picked in Settings; null = auto-pick the best-scoring one available
     },
     opportunities: [],    // pipeline: Idea -> ... -> Completed
     goals: [],             // SMART goals — see GoalModel
@@ -2540,6 +2541,11 @@ function migrateState(state){
   if(state.schemaVersion < 29){
     if(state.integrations.emailAccounts === undefined) state.integrations.emailAccounts = [];
     state.schemaVersion = 29;
+  }
+  // v29 -> v30: manual voice-selection override for notification announcements.
+  if(state.schemaVersion < 30){
+    if(state.notificationSettings.voiceName === undefined) state.notificationSettings.voiceName = null;
+    state.schemaVersion = 30;
   }
   return state;
 }
@@ -5411,6 +5417,195 @@ function applyMeetingRecapFailure(note, message){
   renderApp();
 }
 
+/* ==========================================================================
+   SECTION: VENTURE BRAIN-DUMP (voice-driven business + mission creation)
+   Same MediaRecorder pattern as ideas/meeting recaps, deliberately kept
+   separate for the same reason: nothing about this can interfere with the
+   other two capture flows. Talk through a new business idea, or a pile of
+   upcoming work for one you already run — this turns the ramble into a
+   real starting point (a business, a project, missions with task
+   checklists) that's reviewed and edited before anything is actually
+   created, never auto-committed sight-unseen.
+   ========================================================================== */
+let ventureRecording = false;
+let ventureRecorder = null;
+let ventureChunks = [];
+let ventureStream = null;
+
+async function startVentureRecording(){
+  if(ventureRecording) return;
+  if(!mediaRecorderSupported()){ showToast("Voice recording isn't supported in this browser"); return; }
+  let stream;
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  }catch(err){
+    showToast("Microphone access denied or unavailable");
+    return;
+  }
+  const mimeType = pickRecorderMimeType();
+  const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+  ventureStream = stream;
+  ventureRecorder = recorder;
+  ventureChunks = [];
+  recorder.ondataavailable = (e) => { if(e.data && e.data.size > 0) ventureChunks.push(e.data); };
+  recorder.onstop = () => {
+    stream.getTracks().forEach(t => t.stop());
+    const finalMimeType = recorder.mimeType || mimeType || "audio/webm";
+    const blob = new Blob(ventureChunks, { type: finalMimeType });
+    ventureChunks = [];
+    handleVentureRecorded(blob, finalMimeType);
+  };
+  recorder.start();
+  ventureRecording = true;
+  renderApp();
+}
+function stopVentureRecording(){
+  if(!ventureRecording || !ventureRecorder) return;
+  ventureRecording = false;
+  try{ ventureRecorder.stop(); }catch(e){}
+  renderApp();
+}
+
+async function handleVentureRecorded(blob, mimeType){
+  showToast("Captured — figuring out the business and missions…");
+  let audioBase64;
+  try{
+    audioBase64 = await blobToBase64(blob);
+  }catch(e){
+    showToast("Couldn't read the recording");
+    return;
+  }
+  const businesses = STATE.businesses.map(b => ({ id: b.id, name: b.name }));
+  const vocabulary = buildVoiceVocabularyHints();
+  let resp;
+  try{
+    resp = await fetch("/api/voice/capture", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audioBase64, mimeType, mode: "venture", businesses, vocabulary }),
+    });
+  }catch(err){
+    showToast("No connection — try again once you're back online");
+    return;
+  }
+  if(!resp.ok){
+    showToast("Transcription failed — try again");
+    return;
+  }
+  const data = await resp.json().catch(() => null);
+  if(!data){ showToast("That came back empty — try again"); return; }
+  openVentureReviewModal(data);
+}
+
+// Always a review step, never an auto-commit — the founder confirms/edits
+// the business, project name, and every suggested mission (with its task
+// checklist) before anything is actually created. Missions can be
+// individually excluded via their own checkbox.
+function openVentureReviewModal(data){
+  const bizOptions = STATE.businesses.map(b => `<option value="${b.id}" ${data.matchType === "existing" && data.matchBusinessId === b.id ? "selected" : ""}>${escapeHtml(b.name)}</option>`).join("");
+  const useExisting = data.matchType === "existing" && data.matchBusinessId && STATE.businesses.some(b => b.id === data.matchBusinessId);
+
+  const missionRows = data.missions.map((m, i) => `
+    <div class="card glass" style="margin-bottom:8px;padding:12px;" data-venture-mission-index="${i}">
+      <div style="display:flex;gap:8px;align-items:flex-start;">
+        <input type="checkbox" class="venture-mission-include" checked style="margin-top:10px;" />
+        <div style="flex:1;">
+          <input class="field-input venture-mission-title" value="${escapeHtml(m.title)}" style="margin-bottom:6px;" />
+          <div class="field-row">
+            <select class="field-select venture-mission-priority" style="flex:0 0 110px;">
+              <option value="high" ${m.priority === "high" ? "selected" : ""}>High</option>
+              <option value="medium" ${m.priority === "medium" ? "selected" : ""}>Medium</option>
+              <option value="low" ${m.priority === "low" ? "selected" : ""}>Low</option>
+            </select>
+            <input class="field-input venture-mission-minutes" type="number" min="5" step="5" value="${m.estimatedMinutes}" style="flex:0 0 90px;" />
+            <span style="align-self:center;font-size:12px;color:var(--text-tertiary);">minutes</span>
+          </div>
+          ${m.tasks.length ? `<textarea class="field-textarea venture-mission-tasks" style="margin-top:6px;min-height:${Math.min(120, 24 * m.tasks.length + 20)}px;">${escapeHtml(m.tasks.join("\n"))}</textarea>` : `<textarea class="field-textarea venture-mission-tasks" style="margin-top:6px;min-height:50px;" placeholder="Tasks, one per line"></textarea>`}
+        </div>
+      </div>
+    </div>`).join("");
+
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">Review before creating</div>
+      <button class="modal-close" data-modal-close>${icon("close")}</button>
+    </div>
+    <div class="field">
+      <label class="field-label">Transcript</label>
+      <div style="font-size:12.5px;color:var(--text-secondary);max-height:80px;overflow-y:auto;">${escapeHtml(data.transcript)}</div>
+    </div>
+    <div class="field">
+      <label class="field-label">Business</label>
+      <div class="tab-group" style="margin-bottom:8px;">
+        <button type="button" class="tab-btn ${!useExisting ? "active" : ""}" data-venture-biz-mode="new">New business</button>
+        <button type="button" class="tab-btn ${useExisting ? "active" : ""}" data-venture-biz-mode="existing">Existing business</button>
+      </div>
+      <input class="field-input" id="ventureNewBizName" value="${escapeHtml(data.newBusinessName || "")}" placeholder="Business name" style="display:${!useExisting ? "block" : "none"};" />
+      <select class="field-select" id="ventureExistingBiz" style="display:${useExisting ? "block" : "none"};width:100%;">${bizOptions}</select>
+    </div>
+    <div class="field">
+      <label class="field-label">Project name</label>
+      <input class="field-input" id="ventureProjectName" value="${escapeHtml(data.projectName)}" />
+    </div>
+    <div class="field">
+      <label class="field-label">Missions (${data.missions.length}) — uncheck any you don't want</label>
+      ${missionRows || `<div style="font-size:13px;color:var(--text-secondary);">Nothing actionable came through — you can still create the business/project and add missions manually.</div>`}
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
+      <button type="button" class="btn btn-primary" id="ventureCreateBtn">${icon("check")} Create</button>
+    </div>
+  `, (root) => {
+    let bizMode = useExisting ? "existing" : "new";
+    root.querySelectorAll("[data-venture-biz-mode]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        bizMode = btn.getAttribute("data-venture-biz-mode");
+        root.querySelectorAll("[data-venture-biz-mode]").forEach(b => b.classList.toggle("active", b === btn));
+        root.querySelector("#ventureNewBizName").style.display = bizMode === "new" ? "block" : "none";
+        root.querySelector("#ventureExistingBiz").style.display = bizMode === "existing" ? "block" : "none";
+      });
+    });
+
+    root.querySelector("#ventureCreateBtn").addEventListener("click", () => {
+      let business;
+      if(bizMode === "existing"){
+        const bizId = root.querySelector("#ventureExistingBiz").value;
+        business = businessById(bizId);
+        if(!business){ showToast("Pick a business first"); return; }
+      }else{
+        const name = root.querySelector("#ventureNewBizName").value.trim();
+        if(!name){ showToast("Give the new business a name first"); return; }
+        business = createBusiness({ name, status: "ontrack" });
+      }
+
+      const projectName = root.querySelector("#ventureProjectName").value.trim() || "New Work";
+      const project = createProject({ businessId: business.id, name: projectName, status: "active" });
+
+      let createdCount = 0;
+      root.querySelectorAll("[data-venture-mission-index]").forEach(card => {
+        const include = card.querySelector(".venture-mission-include").checked;
+        if(!include) return;
+        const title = card.querySelector(".venture-mission-title").value.trim() || "Untitled Mission";
+        const priority = card.querySelector(".venture-mission-priority").value;
+        const estimatedMinutes = Math.max(5, Number(card.querySelector(".venture-mission-minutes").value) || 60);
+        const taskLines = card.querySelector(".venture-mission-tasks").value.split("\n").map(s => s.trim()).filter(Boolean);
+        createMission({
+          businessId: business.id, projectId: project.id, title, priority, estimatedMinutes,
+          impactScore: priority === "high" ? 8 : priority === "medium" ? 5 : 3,
+          tasks: taskLines.map(t => TaskModel({ title: t })),
+        });
+        createdCount++;
+      });
+
+      closeModal();
+      fireNotification("complete");
+      showToast(`Created ${escapeHtml(business.name)} — ${escapeHtml(project.name)} with ${createdCount} mission${createdCount === 1 ? "" : "s"}`);
+      renderApp();
+    });
+  });
+  renderApp();
+}
+
 // Shown only when opened via the home screen "New Idea" shortcut
 // (manifest.json shortcuts -> ?capture=1). A real tap here is what lets
 // getUserMedia's mic-permission prompt fire reliably on browsers (notably
@@ -5571,7 +5766,51 @@ const NOTIFICATION_VOICE_LINES = {
   absence: "Hey, you haven't been in Founder OS in a while.",
   generic: "",
 };
-function speakNotification(category, customText){
+// The browser's default TTS voice tends to sound flat/robotic — this picks
+// the most natural-sounding one actually available on this device/browser
+// instead of just using whatever's first in the list, with a manual
+// override in Settings for anyone who wants to pick a specific one.
+let cachedVoices = [];
+function loadVoicesOnce(){
+  return new Promise((resolve) => {
+    const existing = window.speechSynthesis ? window.speechSynthesis.getVoices() : [];
+    if(existing.length){ cachedVoices = existing; resolve(existing); return; }
+    if(!window.speechSynthesis){ resolve([]); return; }
+    window.speechSynthesis.onvoiceschanged = () => {
+      cachedVoices = window.speechSynthesis.getVoices();
+      resolve(cachedVoices);
+    };
+    // Some browsers never fire the event if voices load synchronously
+    // elsewhere — this makes sure we don't hang forever waiting.
+    setTimeout(() => { if(!cachedVoices.length) resolve(window.speechSynthesis.getVoices()); }, 500);
+  });
+}
+// Named "Natural"/"Neural"/"Premium"/"Enhanced"/"Studio" voices (when the
+// platform exposes them) are a real quality signal, not marketing —
+// they're genuinely different, better voice models than the robotic
+// legacy default most browsers fall back to.
+function scoreVoiceQuality(voice){
+  const name = voice.name.toLowerCase();
+  let score = 0;
+  if(/natural|neural|premium|enhanced|studio/.test(name)) score += 10;
+  if(/google/.test(name)) score += 3;
+  if(voice.lang && voice.lang.toLowerCase().startsWith("en")) score += 2;
+  if(/compact|espeak|robot/.test(name)) score -= 5;
+  return score;
+}
+async function getPreferredVoice(){
+  if(!("speechSynthesis" in window)) return null;
+  const voices = cachedVoices.length ? cachedVoices : await loadVoicesOnce();
+  if(!voices.length) return null;
+  const savedName = STATE.notificationSettings.voiceName;
+  if(savedName){
+    const match = voices.find(v => v.name === savedName);
+    if(match) return match;
+  }
+  return voices.slice().sort((a, b) => scoreVoiceQuality(b) - scoreVoiceQuality(a))[0];
+}
+
+async function speakNotification(category, customText){
   if(!STATE.notificationSettings.voiceEnabled) return;
   if(!("speechSynthesis" in window)) return;
   const text = customText || NOTIFICATION_VOICE_LINES[category] || "";
@@ -5579,6 +5818,10 @@ function speakNotification(category, customText){
   try{
     window.speechSynthesis.cancel(); // don't let announcements stack/overlap
     const utter = new SpeechSynthesisUtterance(text);
+    const voice = await getPreferredVoice();
+    if(voice) utter.voice = voice;
+    utter.rate = 0.97;  // very slightly slower than default reads as calmer, less clipped
+    utter.pitch = 1.0;
     window.speechSynthesis.speak(utter);
   }catch(e){ /* TTS unavailable — silently skip */ }
 }
@@ -6143,7 +6386,10 @@ function renderPortfolio(){
   <div class="view-enter">
     <div class="toolbar">
       <div class="view-desc" style="margin:0;">${STATE.businesses.length} businesses in the portfolio</div>
-      <button class="btn btn-primary" data-action="new-business">${icon("plus")} New business</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-ghost" id="ventureBrainDumpBtn">${icon("mic")} ${ventureRecording ? "Recording… tap to finish" : "Brain-dump a business/project"}</button>
+        <button class="btn btn-primary" data-action="new-business">${icon("plus")} New business</button>
+      </div>
     </div>
     <div class="grid dash-grid">
       ${cards || `<div class="col-12">${emptyState("layers", "No businesses yet", "Add your first business to start building out your portfolio.")}</div>`}
@@ -8834,6 +9080,14 @@ function renderSettings(){
             <div><div class="settings-row-label">Voice announcements</div><div class="settings-row-desc">Speaks the notification out loud</div></div>
             <div class="toggle ${STATE.notificationSettings.voiceEnabled ? "on" : ""}" data-action="toggle-voice-enabled"><div class="toggle-knob"></div></div>
           </div>
+          ${STATE.notificationSettings.voiceEnabled ? `
+          <div class="settings-row">
+            <div><div class="settings-row-label">Voice</div><div class="settings-row-desc">Browsers default to a fairly robotic voice — pick a better-sounding one if your device offers one</div></div>
+            <select class="field-select" id="voiceNameSelect" style="max-width:220px;">
+              <option value="">Auto (best available)</option>
+              ${cachedVoices.map(v => `<option value="${escapeHtml(v.name)}" ${STATE.notificationSettings.voiceName === v.name ? "selected" : ""}>${escapeHtml(v.name)}</option>`).join("")}
+            </select>
+          </div>` : ""}
           <div class="settings-row">
             <div><div class="settings-row-label">Try it</div><div class="settings-row-desc">Hear what "time's up" sounds like</div></div>
             <button class="btn btn-ghost btn-sm" data-action="test-notification-sound">${icon("bell")} Test</button>
@@ -9660,6 +9914,14 @@ function bindEvents(){
       renderApp();
     });
   }
+  const voiceNameSelect = document.getElementById("voiceNameSelect");
+  if(voiceNameSelect){
+    voiceNameSelect.addEventListener("change", () => {
+      STATE.notificationSettings.voiceName = voiceNameSelect.value || null;
+      saveState();
+      speakNotification("ontrack", "This is what I sound like now.");
+    });
+  }
   const testSoundBtn = document.querySelector('[data-action="test-notification-sound"]');
   if(testSoundBtn){
     testSoundBtn.addEventListener("click", () => {
@@ -9858,6 +10120,13 @@ function bindPortfolioEvents(){
       renderApp();
     });
   });
+  const ventureBtn = document.getElementById("ventureBrainDumpBtn");
+  if(ventureBtn){
+    ventureBtn.addEventListener("click", () => {
+      if(ventureRecording) stopVentureRecording();
+      else startVentureRecording();
+    });
+  }
   const backBtn = document.querySelector('[data-action="portfolio-back"]');
   if(backBtn){
     backBtn.addEventListener("click", () => {
@@ -10818,6 +11087,7 @@ function initApp(){
         });
       }
       scheduleAbsenceReminder();
+      if("speechSynthesis" in window) loadVoicesOnce(); // warm the cache so Settings' voice picker has options ready
       maybeShowQuickCaptureOverlay();
       maybeShowQuickFocusOverlay();
     }).catch(renderFatalError);

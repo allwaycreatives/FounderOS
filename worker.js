@@ -418,7 +418,7 @@ async function handleVoiceCapture(request, env) {
     return json({ error: "audioBase64 and mimeType are required" }, 400);
   }
 
-  const mode = body.mode === "meeting" ? "meeting" : "idea";
+  const mode = body.mode === "meeting" ? "meeting" : (body.mode === "venture" ? "venture" : "idea");
   const businesses = Array.isArray(body.businesses) ? body.businesses : [];
   const projects = Array.isArray(body.projects) ? body.projects : [];
   const contacts = Array.isArray(body.contacts) ? body.contacts : [];
@@ -426,7 +426,26 @@ async function handleVoiceCapture(request, env) {
   const vocabLine = vocabulary.length ? ` The speaker runs a business and uses these proper nouns often — if something sounds close to one of these, prefer it over a generic word: ${vocabulary.join(", ")}.` : "";
 
   let instruction;
-  if (mode === "meeting") {
+  if (mode === "venture") {
+    // "Brain-dump a business or a pile of work" — the founder talks
+    // through a new business idea, or a stack of upcoming work for an
+    // existing one, and this turns the ramble into an actual structured
+    // starting point: a business (new or matched to an existing one), a
+    // project, and a set of real missions with task checklists — instead
+    // of the founder filling out forms by hand for each piece.
+    const catalog = businesses.map(b => `business:${b.id} — ${b.name}`).join("\n");
+    instruction = `Transcribe the attached voice memo exactly, word for word — the ENTIRE recording, however long. Do not summarize or cut off the transcript itself; the full verbatim transcript goes in the "transcript" field.${vocabLine} This is a founder talking through either a brand-new business/venture idea, or a pile of upcoming work for a business they already run. Turn it into a structured starting point.
+
+Using ONLY this list of the founder's existing businesses, decide whether the memo is clearly about one of them, or something new:
+${catalog || "(none defined yet — always respond with matchType new)"}
+
+Then break down the actionable work mentioned into concrete Missions — each with a short punchy actionable title (imperative, concrete), a priority based on any urgency cues in what was said, a rough time estimate in minutes (use your judgment if not stated explicitly — err toward realistic, not optimistic), and a short checklist of concrete tasks that make up that mission. Only include missions/tasks that are genuinely implied by what was said — don't invent unrelated work.
+
+Respond with ONLY this JSON object, no markdown fencing, no commentary:
+{"transcript": "the complete, unabridged transcript", "matchType": "existing" | "new" | "none", "matchBusinessId": "an id from the list above if matchType is existing, else null", "newBusinessName": "a suggested name if matchType is new, else empty string", "projectName": "a short name for the body of work described, e.g. 'Launch' or 'Q4 Push'", "missions": [{"title": "...", "priority": "high" | "medium" | "low", "estimatedMinutes": 60, "tasks": ["...", "..."]}]}
+
+If genuinely nothing actionable was said, missions can be an empty array — don't force it.`;
+  } else if (mode === "meeting") {
     // Structured call/meeting recap: the founder talks through what just
     // happened on a call (WhatsApp, phone, whatever) right after hanging
     // up, and this turns that into something actually useful to file away
@@ -481,7 +500,7 @@ Only choose a match if the memo clearly names or strongly, unambiguously implies
               { inlineData: { mimeType: body.mimeType, data: body.audioBase64 } },
             ],
           }],
-          generationConfig: { maxOutputTokens: mode === "meeting" ? 4000 : 3000, responseMimeType: "application/json" },
+          generationConfig: { maxOutputTokens: mode === "venture" ? 5000 : (mode === "meeting" ? 4000 : 3000), responseMimeType: "application/json" },
         }),
       }
     );
@@ -518,6 +537,22 @@ Only choose a match if the memo clearly names or strongly, unambiguously implies
     parsed = { transcript: salvaged };
   }
 
+  if (mode === "venture") {
+    const missions = Array.isArray(parsed.missions) ? parsed.missions.map(m => ({
+      title: (m && m.title) || "Untitled Mission",
+      priority: (m && ["high", "medium", "low"].includes(m.priority)) ? m.priority : "medium",
+      estimatedMinutes: (m && typeof m.estimatedMinutes === "number" && m.estimatedMinutes > 0) ? m.estimatedMinutes : 60,
+      tasks: (m && Array.isArray(m.tasks)) ? m.tasks.filter(Boolean) : [],
+    })) : [];
+    return json({
+      transcript: parsed.transcript || "",
+      matchType: ["existing", "new", "none"].includes(parsed.matchType) ? parsed.matchType : "none",
+      matchBusinessId: parsed.matchBusinessId || null,
+      newBusinessName: parsed.newBusinessName || "",
+      projectName: parsed.projectName || "New Work",
+      missions,
+    }, 200);
+  }
   if (mode === "meeting") {
     return json({
       transcript: parsed.transcript || "",
