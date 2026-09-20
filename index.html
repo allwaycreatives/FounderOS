@@ -1427,7 +1427,7 @@ const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAg
 
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
-  SCHEMA_VERSION: 30,
+  SCHEMA_VERSION: 31,
   APP_NAME: "Founder OS",
   // Matches VAPID_PUBLIC_KEY in worker.js exactly — this half isn't
   // secret (only the private key, held server-side, needs to be), so
@@ -2136,6 +2136,8 @@ function getDefaultState(){
     },
     opportunities: [],    // pipeline: Idea -> ... -> Completed
     goals: [],             // SMART goals — see GoalModel
+    emailDrafts: [],       // saved-for-later drafts from the voice composer — not sent, not scheduled
+    scheduledEmails: [],   // local record of what's pending server-side (see PUSH_KV emailsend: entries) — purely for display/cancel, the Worker's copy is the source of truth for actually sending
     ideas: [],            // Idea Vault inbox
     journalEntries: [],   // CEO Journal, one per calendar day
     founder: null,        // FounderProfileModel, set by the Setup Wizard; stays null on the demo path
@@ -2546,6 +2548,12 @@ function migrateState(state){
   if(state.schemaVersion < 30){
     if(state.notificationSettings.voiceName === undefined) state.notificationSettings.voiceName = null;
     state.schemaVersion = 30;
+  }
+  // v30 -> v31: voice-to-email — saved drafts and locally-tracked scheduled sends.
+  if(state.schemaVersion < 31){
+    if(state.emailDrafts === undefined) state.emailDrafts = [];
+    if(state.scheduledEmails === undefined) state.scheduledEmails = [];
+    state.schemaVersion = 31;
   }
   return state;
 }
@@ -5606,6 +5614,211 @@ function openVentureReviewModal(data){
   renderApp();
 }
 
+/* ==========================================================================
+   SECTION: VOICE-TO-EMAIL (record the gist, get a polished draft)
+   Same MediaRecorder pattern as ideas/meetings/ventures, kept separate for
+   the same reason as always — isolation between capture flows. The point
+   here specifically: catch a message you want to send before you forget
+   it, even if you're not in a position to actually send it right then.
+   Every recording ends at a review step with three real choices — Send
+   now, Save as draft (for later, unsent), or Schedule (a real
+   server-side send at a future time) — never an automatic send.
+   ========================================================================== */
+let emailDraftRecording = false;
+let emailDraftRecorder = null;
+let emailDraftChunks = [];
+let emailDraftStream = null;
+let emailDraftPresetContactId = null; // set when recording was started from a specific contact's page
+
+async function startEmailDraftRecording(presetContactId){
+  if(emailDraftRecording) return;
+  if(!mediaRecorderSupported()){ showToast("Voice recording isn't supported in this browser"); return; }
+  emailDraftPresetContactId = presetContactId || null;
+  let stream;
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  }catch(err){
+    showToast("Microphone access denied or unavailable");
+    return;
+  }
+  const mimeType = pickRecorderMimeType();
+  const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+  emailDraftStream = stream;
+  emailDraftRecorder = recorder;
+  emailDraftChunks = [];
+  recorder.ondataavailable = (e) => { if(e.data && e.data.size > 0) emailDraftChunks.push(e.data); };
+  recorder.onstop = () => {
+    stream.getTracks().forEach(t => t.stop());
+    const finalMimeType = recorder.mimeType || mimeType || "audio/webm";
+    const blob = new Blob(emailDraftChunks, { type: finalMimeType });
+    emailDraftChunks = [];
+    handleEmailDraftRecorded(blob, finalMimeType);
+  };
+  recorder.start();
+  emailDraftRecording = true;
+  renderApp();
+}
+function stopEmailDraftRecording(){
+  if(!emailDraftRecording || !emailDraftRecorder) return;
+  emailDraftRecording = false;
+  try{ emailDraftRecorder.stop(); }catch(e){}
+  renderApp();
+}
+
+async function handleEmailDraftRecorded(blob, mimeType){
+  showToast("Captured — drafting your email…");
+  let audioBase64;
+  try{
+    audioBase64 = await blobToBase64(blob);
+  }catch(e){
+    showToast("Couldn't read the recording");
+    return;
+  }
+  const contacts = STATE.contacts.filter(c => c.email && c.email.trim()).map(c => ({ id: c.id, name: c.name, email: c.email }));
+  const vocabulary = buildVoiceVocabularyHints();
+  let resp;
+  try{
+    resp = await fetch("/api/voice/capture", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audioBase64, mimeType, mode: "emaildraft", contacts, vocabulary }),
+    });
+  }catch(err){
+    showToast("No connection — try again once you're back online");
+    return;
+  }
+  if(!resp.ok){ showToast("Transcription failed — try again"); return; }
+  const data = await resp.json().catch(() => null);
+  if(!data){ showToast("That came back empty — try again"); return; }
+
+  const presetContact = emailDraftPresetContactId ? STATE.contacts.find(c => c.id === emailDraftPresetContactId) : null;
+  const matchedContact = presetContact || (data.matchType === "contact" && data.matchContactId ? STATE.contacts.find(c => c.id === data.matchContactId) : null);
+  openEmailDraftReviewModal(data, matchedContact);
+}
+
+function openEmailDraftReviewModal(data, matchedContact){
+  const contactsWithEmail = STATE.contacts.filter(c => c.email && c.email.trim());
+  const contactOptions = contactsWithEmail.map(c => `<option value="${c.id}" ${matchedContact && matchedContact.id === c.id ? "selected" : ""}>${escapeHtml(c.name)} (${escapeHtml(c.email)})</option>`).join("");
+  const accountOptions = [
+    `<option value="">${STATE.integrations.google.connected ? `Main (${escapeHtml(STATE.integrations.google.accountEmail || "connected")})` : "Main (not connected)"}</option>`,
+    ...STATE.integrations.emailAccounts.map(a => `<option value="${a.id}">${escapeHtml(a.email)}</option>`),
+  ].join("");
+
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">Review your email</div>
+      <button class="modal-close" data-modal-close>${icon("close")}</button>
+    </div>
+    <div class="field" style="display:${data.transcript ? "block" : "none"};">
+      <label class="field-label">Transcript</label>
+      <div style="font-size:12.5px;color:var(--text-secondary);max-height:60px;overflow-y:auto;">${escapeHtml(data.transcript || "")}</div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label class="field-label">To</label>
+        <select class="field-select" id="draftToContact">
+          <option value="">— Pick a contact —</option>
+          ${contactOptions}
+        </select>
+      </div>
+      <div class="field">
+        <label class="field-label">Send as</label>
+        <select class="field-select" id="draftFromAccount">${accountOptions}</select>
+      </div>
+    </div>
+    <div class="field">
+      <label class="field-label">Subject</label>
+      <input class="field-input" id="draftSubject" value="${escapeHtml(data.subject)}" />
+    </div>
+    <div class="field">
+      <label class="field-label">Body</label>
+      <textarea class="field-textarea" id="draftBody" style="min-height:180px;">${escapeHtml(data.body)}</textarea>
+    </div>
+    <div class="field">
+      <label class="field-label">When</label>
+      <div class="tab-group" style="margin-bottom:8px;flex-wrap:wrap;">
+        <button type="button" class="tab-btn active" data-draft-when="now">Send now</button>
+        <button type="button" class="tab-btn" data-draft-when="1h">In 1 hour</button>
+        <button type="button" class="tab-btn" data-draft-when="3h">In 3 hours</button>
+        <button type="button" class="tab-btn" data-draft-when="tomorrow">Tomorrow 9am</button>
+        <button type="button" class="tab-btn" data-draft-when="custom">Custom</button>
+        <button type="button" class="tab-btn" data-draft-when="draft">Just save as draft</button>
+      </div>
+      <input class="field-input" type="datetime-local" id="draftCustomWhen" style="display:none;" />
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
+      <button type="button" class="btn btn-primary" id="draftActionBtn">${icon("send")} Send now</button>
+    </div>
+  `, (root) => {
+    let when = "now";
+    const customInput = root.querySelector("#draftCustomWhen");
+    const actionBtn = root.querySelector("#draftActionBtn");
+    const labelFor = { now: "Send now", "1h": "Schedule for +1h", "3h": "Schedule for +3h", tomorrow: "Schedule for tomorrow 9am", custom: "Schedule", draft: "Save as draft" };
+    root.querySelectorAll("[data-draft-when]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        when = btn.getAttribute("data-draft-when");
+        root.querySelectorAll("[data-draft-when]").forEach(b => b.classList.toggle("active", b === btn));
+        customInput.style.display = when === "custom" ? "block" : "none";
+        actionBtn.innerHTML = `${icon(when === "draft" ? "check" : "send")} ${labelFor[when]}`;
+      });
+    });
+
+    actionBtn.addEventListener("click", async () => {
+      const contactId = root.querySelector("#draftToContact").value;
+      const contact = STATE.contacts.find(c => c.id === contactId);
+      const subject = root.querySelector("#draftSubject").value.trim();
+      const body = root.querySelector("#draftBody").value.trim();
+      const accountId = root.querySelector("#draftFromAccount").value || null;
+      const account = resolveEmailAccount(accountId);
+
+      if(when === "draft"){
+        STATE.emailDrafts.unshift({ id: makeId("draft"), contactId: contactId || null, to: contact ? contact.email : "", subject, body, createdAt: Date.now() });
+        saveState();
+        closeModal();
+        showToast("Saved as draft");
+        renderApp();
+        return;
+      }
+      if(!contact){ showToast("Pick who this is going to first"); return; }
+
+      actionBtn.disabled = true;
+      actionBtn.textContent = "Working…";
+      try{
+        if(when === "now"){
+          await sendGmailMessage({ to: contact.email, subject, body, refreshToken: account.refreshToken });
+          showToast(`Sent to ${contact.name}`);
+          fireNotification("complete");
+        }else{
+          let dueAt;
+          if(when === "1h") dueAt = Date.now() + 60 * 60 * 1000;
+          else if(when === "3h") dueAt = Date.now() + 3 * 60 * 60 * 1000;
+          else if(when === "tomorrow"){
+            const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(9, 0, 0, 0);
+            dueAt = d.getTime();
+          }else{
+            const val = customInput.value;
+            if(!val){ showToast("Pick a date/time first"); actionBtn.disabled = false; actionBtn.textContent = labelFor[when]; return; }
+            dueAt = new Date(val).getTime();
+          }
+          const id = await scheduleEmailSend({ to: contact.email, subject, body, dueAt, refreshToken: account.refreshToken });
+          STATE.scheduledEmails.unshift({ id, to: contact.email, contactName: contact.name, subject, dueAt });
+          saveState();
+          showToast(`Scheduled for ${new Date(dueAt).toLocaleString()}`);
+        }
+        closeModal();
+        delete emailThreadCache[`${contact.id}::${emailAccountKey(accountId)}`];
+        renderApp();
+      }catch(err){
+        actionBtn.disabled = false;
+        actionBtn.textContent = labelFor[when];
+        showToast(`Failed: ${err.message || err}`);
+      }
+    });
+  });
+  renderApp();
+}
+
 // Shown only when opened via the home screen "New Idea" shortcut
 // (manifest.json shortcuts -> ?capture=1). A real tap here is what lets
 // getUserMedia's mic-permission prompt fire reliably on browsers (notably
@@ -5979,6 +6192,36 @@ async function cancelPushReminder(id){
       body: JSON.stringify({ id }),
     });
   }catch(e){ /* not worth surfacing — worst case an already-cancelled session still gets one stray reminder */ }
+}
+
+// Schedules a REAL server-side send (see worker.js's runDueEmails) — this
+// fires even if the app/browser is fully closed by the time it's due,
+// unlike a client-side setTimeout which dies the moment the tab closes.
+// That means the refresh token for whichever account is sending has to
+// go to the Worker now, not just live in this browser — a real step up
+// in what's stored server-side, done deliberately because "schedule it
+// and walk away" doesn't work any other way.
+async function scheduleEmailSend({ to, subject, body, dueAt, refreshToken }){
+  const clientId = CONFIG.GOOGLE_CLIENT_ID;
+  const effectiveRefreshToken = refreshToken || STATE.integrations.google.refreshToken;
+  if(!effectiveRefreshToken) throw new Error("This account isn't connected — reconnect it in Settings first");
+  const resp = await fetch("/api/email/schedule", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refreshToken: effectiveRefreshToken, clientId, to, subject, body, dueAt, deviceId: getDeviceId() }),
+  });
+  const data = await resp.json().catch(() => null);
+  if(!resp.ok || !data || !data.id) throw new Error((data && data.error) || `Scheduling failed (${resp.status})`);
+  return data.id;
+}
+async function cancelScheduledEmailServer(id){
+  try{
+    await fetch("/api/email/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+  }catch(e){ /* best effort — worst case a cancelled send still goes out once */ }
 }
 
 /* ==========================================================================
@@ -7864,14 +8107,46 @@ function renderEmail(){
     }
   }
 
+  const draftsSection = STATE.emailDrafts.length ? `
+    <div class="card glass" style="margin-bottom:var(--space-4);">
+      <h3 class="card-title">${icon("edit")} Drafts (${STATE.emailDrafts.length})</h3>
+      ${STATE.emailDrafts.map(d => `
+        <div class="notif-row">
+          <div style="flex:1;min-width:0;">
+            <div class="notif-row-title">${escapeHtml(d.subject || "(no subject)")}</div>
+            <div class="notif-row-desc">To: ${escapeHtml(d.to || "—")}</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" data-action="open-email-draft" data-id="${d.id}">Open</button>
+          <button class="icon-btn" data-action="delete-email-draft" data-id="${d.id}" title="Delete">${icon("trash")}</button>
+        </div>`).join("")}
+    </div>` : "";
+
+  const scheduledSection = STATE.scheduledEmails.length ? `
+    <div class="card glass" style="margin-bottom:var(--space-4);">
+      <h3 class="card-title">${icon("focus")} Scheduled (${STATE.scheduledEmails.length})</h3>
+      ${STATE.scheduledEmails.map(s => `
+        <div class="notif-row">
+          <div style="flex:1;min-width:0;">
+            <div class="notif-row-title">${escapeHtml(s.subject || "(no subject)")}</div>
+            <div class="notif-row-desc">To ${escapeHtml(s.contactName || s.to)} · ${new Date(s.dueAt).toLocaleString()}</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" data-action="cancel-scheduled-email" data-id="${s.id}">Cancel</button>
+        </div>`).join("")}
+    </div>` : "";
+
   return `
   <div class="view-enter">
+    ${draftsSection}
+    ${scheduledSection}
     <div class="toolbar">
       <div class="toolbar-filters">
         <label class="field-label" style="margin:0;">Account</label>
         <select class="field-select" id="emailAccountSelect">${accountOptions}</select>
       </div>
-      <button class="btn btn-ghost btn-sm" data-action="add-email-account">${icon("plus")} Add another account</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-ghost btn-sm" id="emailDraftRecordBtn">${icon("mic")} ${emailDraftRecording ? "Recording… tap to finish" : "Record a message"}</button>
+        <button class="btn btn-ghost btn-sm" data-action="add-email-account">${icon("plus")} Add another account</button>
+      </div>
     </div>
     <div style="display:grid;grid-template-columns:280px 1fr;gap:var(--space-4);align-items:start;">
       <div class="card glass" style="max-height:70vh;overflow-y:auto;">
@@ -7882,7 +8157,10 @@ function renderEmail(){
         ${selectedContact ? `
           <div class="toolbar">
             <div style="font-weight:700;font-size:14px;">${escapeHtml(selectedContact.name)} <span style="font-weight:400;color:var(--text-tertiary);font-size:12.5px;">${escapeHtml(selectedContact.email)}</span></div>
-            <button class="btn btn-primary btn-sm" data-action="compose-email" data-id="${selectedContact.id}">${icon("send")} Compose</button>
+            <div style="display:flex;gap:8px;">
+              <button class="btn btn-ghost btn-sm" data-action="record-email-for-contact" data-id="${selectedContact.id}">${icon("mic")} Record</button>
+              <button class="btn btn-primary btn-sm" data-action="compose-email" data-id="${selectedContact.id}">${icon("send")} Compose</button>
+            </div>
           </div>
           <div style="font-size:11.5px;color:var(--text-tertiary);margin:-6px 0 10px;">Sending as ${escapeHtml(activeAccount.label)}</div>` : ""}
         ${threadPane}
@@ -10352,6 +10630,47 @@ function bindEmailEvents(){
   }
   const addEmailAccountBtn = document.querySelector('[data-action="add-email-account"]');
   if(addEmailAccountBtn) addEmailAccountBtn.addEventListener("click", () => connectEmailAccount());
+
+  const emailDraftRecordBtn = document.getElementById("emailDraftRecordBtn");
+  if(emailDraftRecordBtn){
+    emailDraftRecordBtn.addEventListener("click", () => {
+      if(emailDraftRecording) stopEmailDraftRecording();
+      else startEmailDraftRecording(null);
+    });
+  }
+  document.querySelectorAll('[data-action="record-email-for-contact"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      if(emailDraftRecording) stopEmailDraftRecording();
+      else startEmailDraftRecording(btn.getAttribute("data-id"));
+    });
+  });
+  document.querySelectorAll('[data-action="open-email-draft"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      const draft = STATE.emailDrafts.find(d => d.id === btn.getAttribute("data-id"));
+      if(!draft) return;
+      const contact = draft.contactId ? STATE.contacts.find(c => c.id === draft.contactId) : null;
+      STATE.emailDrafts = STATE.emailDrafts.filter(d => d.id !== draft.id); // reopening consumes the saved draft — it becomes a fresh review instead of a duplicate
+      saveState();
+      openEmailDraftReviewModal({ transcript: "", subject: draft.subject, body: draft.body }, contact);
+    });
+  });
+  document.querySelectorAll('[data-action="delete-email-draft"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      STATE.emailDrafts = STATE.emailDrafts.filter(d => d.id !== btn.getAttribute("data-id"));
+      saveState();
+      renderApp();
+    });
+  });
+  document.querySelectorAll('[data-action="cancel-scheduled-email"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-id");
+      cancelScheduledEmailServer(id);
+      STATE.scheduledEmails = STATE.scheduledEmails.filter(s => s.id !== id);
+      saveState();
+      showToast("Scheduled send cancelled");
+      renderApp();
+    });
+  });
 }
 
 /* ---- Recovery bindings ---- */

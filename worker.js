@@ -55,17 +55,23 @@ export default {
     if (url.pathname === "/api/push/test") {
       return handlePushTest(request, env);
     }
+    if (url.pathname === "/api/email/schedule") {
+      return handleEmailSchedule(request, env);
+    }
+    if (url.pathname === "/api/email/cancel") {
+      return handleEmailCancel(request, env);
+    }
 
     // Anything else: behave exactly like the old assets-only deployment.
     return env.ASSETS.fetch(request);
   },
 
   // Cron trigger (see wrangler.jsonc — runs every minute). Cheap and
-  // simple over clever: list every pending reminder, fire the ones that
-  // are due, delete them either way. Fine at personal-app scale; would
-  // need a smarter index if this were ever handling many users/reminders.
+  // simple over clever: list every pending reminder/email, fire the ones
+  // that are due, delete them either way. Fine at personal-app scale;
+  // would need a smarter index if this were ever handling many users.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runDueReminders(env));
+    ctx.waitUntil(Promise.all([runDueReminders(env), runDueEmails(env)]));
   },
 };
 
@@ -418,7 +424,7 @@ async function handleVoiceCapture(request, env) {
     return json({ error: "audioBase64 and mimeType are required" }, 400);
   }
 
-  const mode = body.mode === "meeting" ? "meeting" : (body.mode === "venture" ? "venture" : "idea");
+  const mode = body.mode === "meeting" ? "meeting" : (body.mode === "venture" ? "venture" : (body.mode === "emaildraft" ? "emaildraft" : "idea"));
   const businesses = Array.isArray(body.businesses) ? body.businesses : [];
   const projects = Array.isArray(body.projects) ? body.projects : [];
   const contacts = Array.isArray(body.contacts) ? body.contacts : [];
@@ -426,7 +432,22 @@ async function handleVoiceCapture(request, env) {
   const vocabLine = vocabulary.length ? ` The speaker runs a business and uses these proper nouns often — if something sounds close to one of these, prefer it over a generic word: ${vocabulary.join(", ")}.` : "";
 
   let instruction;
-  if (mode === "venture") {
+  if (mode === "emaildraft") {
+    // Record the gist of what you want to say, get back an actual
+    // polished email draft — transcript kept as the source of truth,
+    // subject/body written properly (not just the raw ramble), and a
+    // best-guess at which contact this is for if named.
+    const catalog = contacts.map(c => `contact:${c.id} — ${c.name}${c.email ? ` <${c.email}>` : ""}`).join("\n");
+    instruction = `Transcribe the attached voice memo exactly, word for word — the ENTIRE recording. Do not shorten the transcript itself.${vocabLine} This is a founder speaking roughly what they want to say in an email.
+
+Using ONLY this list of contacts, decide if a specific recipient was clearly named:
+${catalog || "(none defined yet — always respond with matchType none)"}
+
+Then write an actual polished email from the rough spoken intent — a proper subject line, and a body written the way a professional but warm email should read (not a literal transcript of the speech, not overly formal, keep the founder's actual meaning and any specific details/numbers/names they mentioned).
+
+Respond with ONLY this JSON object, no markdown fencing, no commentary:
+{"transcript": "the complete transcript", "subject": "a real subject line", "body": "the polished email body", "matchType": "contact" | "none", "matchContactId": "an id from the list above if matched, else null", "confidence": 0.0 to 1.0}`;
+  } else if (mode === "venture") {
     // "Brain-dump a business or a pile of work" — the founder talks
     // through a new business idea, or a stack of upcoming work for an
     // existing one, and this turns the ramble into an actual structured
@@ -500,7 +521,7 @@ Only choose a match if the memo clearly names or strongly, unambiguously implies
               { inlineData: { mimeType: body.mimeType, data: body.audioBase64 } },
             ],
           }],
-          generationConfig: { maxOutputTokens: mode === "venture" ? 5000 : (mode === "meeting" ? 4000 : 3000), responseMimeType: "application/json" },
+          generationConfig: { maxOutputTokens: mode === "venture" ? 5000 : (mode === "meeting" || mode === "emaildraft" ? 4000 : 3000), responseMimeType: "application/json" },
         }),
       }
     );
@@ -537,6 +558,16 @@ Only choose a match if the memo clearly names or strongly, unambiguously implies
     parsed = { transcript: salvaged };
   }
 
+  if (mode === "emaildraft") {
+    return json({
+      transcript: parsed.transcript || "",
+      subject: parsed.subject || "",
+      body: parsed.body || "",
+      matchType: parsed.matchType === "contact" ? "contact" : "none",
+      matchContactId: parsed.matchContactId || null,
+      confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
+    }, 200);
+  }
   if (mode === "venture") {
     const missions = Array.isArray(parsed.missions) ? parsed.missions.map(m => ({
       title: (m && m.title) || "Untitled Mission",
@@ -778,3 +809,109 @@ function json(obj, status) {
     headers: { "content-type": "application/json" },
   });
 }
+
+/**
+ * Scheduled email sending — the actual "record it, schedule it, walk
+ * away" feature. Same KV + cron pattern as push reminders, but this time
+ * the cron job has to do something more sensitive: refresh a Google
+ * access token and send a real email entirely server-side, with nobody's
+ * browser open. That means the refresh token has to live here, in KV,
+ * not just in the browser — a real security step up from before (push
+ * subscriptions aren't nearly as sensitive as a token that can send email
+ * as the founder). Worth being direct about that trade-off rather than
+ * quietly making it.
+ */
+async function refreshGoogleAccessToken(refreshToken, clientId, env) {
+  const params = new URLSearchParams();
+  params.set("client_id", clientId);
+  params.set("client_secret", env.GOOGLE_CLIENT_SECRET);
+  params.set("refresh_token", refreshToken);
+  params.set("grant_type", "refresh_token");
+  const resp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || data.error) throw new Error(data.error_description || data.error || `Token refresh failed (${resp.status})`);
+  return data.access_token;
+}
+
+function buildRawEmail(to, subject, body) {
+  const message = `To: ${to}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n${body}`;
+  const bytes = new TextEncoder().encode(message);
+  let binary = "";
+  bytes.forEach((b) => { binary += String.fromCharCode(b); });
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function sendGmailServerSide(accessToken, to, subject, body) {
+  return fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ raw: buildRawEmail(to, subject, body) }),
+  });
+}
+
+async function handleEmailSchedule(request, env) {
+  if (request.method !== "POST") return json({ error: "POST only" }, 405);
+  const body = await request.json().catch(() => null);
+  if (!body || !body.refreshToken || !body.clientId || !body.to || !body.dueAt) {
+    return json({ error: "refreshToken, clientId, to, and dueAt are required" }, 400);
+  }
+  const id = crypto.randomUUID();
+  const ttlSeconds = Math.max(60, Math.ceil((body.dueAt - Date.now()) / 1000) + 60 * 60 * 24);
+  await env.PUSH_KV.put(`emailsend:${id}`, JSON.stringify({
+    refreshToken: body.refreshToken,
+    clientId: body.clientId,
+    to: body.to,
+    subject: body.subject || "",
+    body: body.body || "",
+    dueAt: body.dueAt,
+    deviceId: body.deviceId || null, // if set and push-subscribed, gets a "sent" or "failed" notification
+  }), { expirationTtl: ttlSeconds });
+  return json({ ok: true, id });
+}
+
+async function handleEmailCancel(request, env) {
+  if (request.method !== "POST") return json({ error: "POST only" }, 405);
+  const body = await request.json().catch(() => null);
+  if (!body || !body.id) return json({ error: "id is required" }, 400);
+  await env.PUSH_KV.delete(`emailsend:${body.id}`);
+  return json({ ok: true });
+}
+
+async function notifyDeviceIfSubscribed(deviceId, payload, env) {
+  if (!deviceId) return;
+  try {
+    const subRaw = await env.PUSH_KV.get(`subscription:${deviceId}`);
+    if (!subRaw) return;
+    await sendWebPush(JSON.parse(subRaw), payload, env);
+  } catch (e) { /* best effort — a missing confirmation push isn't worth failing over */ }
+}
+
+async function runDueEmails(env) {
+  const now = Date.now();
+  const list = await env.PUSH_KV.list({ prefix: "emailsend:" });
+  for (const key of list.keys) {
+    const raw = await env.PUSH_KV.get(key.name);
+    if (!raw) continue;
+    let item;
+    try { item = JSON.parse(raw); } catch (e) { await env.PUSH_KV.delete(key.name); continue; }
+    if (item.dueAt > now) continue;
+
+    await env.PUSH_KV.delete(key.name); // fires once, regardless of outcome below
+    try {
+      const accessToken = await refreshGoogleAccessToken(item.refreshToken, item.clientId, env);
+      const resp = await sendGmailServerSide(accessToken, item.to, item.subject, item.body);
+      if (resp.ok) {
+        await notifyDeviceIfSubscribed(item.deviceId, { title: "Email sent", body: `Your scheduled email to ${item.to} went out.`, url: "./", category: "complete" }, env);
+      } else {
+        await notifyDeviceIfSubscribed(item.deviceId, { title: "Scheduled email failed", body: `Couldn't send to ${item.to} — check the Email tab.`, url: "./", category: "neglect" }, env);
+      }
+    } catch (e) {
+      await notifyDeviceIfSubscribed(item.deviceId, { title: "Scheduled email failed", body: `Couldn't send to ${item.to} — the account may need reconnecting.`, url: "./", category: "neglect" }, env);
+    }
+  }
+}
+
