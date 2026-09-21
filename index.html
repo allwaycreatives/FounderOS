@@ -1425,6 +1425,21 @@ kbd{
    ========================================================================== */
 const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || "");
 
+// Founder OS was built assuming "you run one or more businesses" — but the
+// underlying structure (a top-level thing, containing projects, containing
+// missions, containing tasks) works just as well for a project manager
+// running client work, they just don't think in "businesses". This swaps
+// the label, not the data model — BusinessModel/STATE.businesses etc. stay
+// exactly as they are internally; only what's shown on screen changes.
+const TERMINOLOGY = {
+  founder: { Business: "Business", Businesses: "Businesses", business: "business", businesses: "businesses" },
+  pm:      { Business: "Client",   Businesses: "Clients",     business: "client",   businesses: "clients" },
+};
+function T(form){
+  const mode = (STATE && STATE.ui && STATE.ui.terminologyMode) || "founder";
+  return (TERMINOLOGY[mode] || TERMINOLOGY.founder)[form] || form;
+}
+
 const CONFIG = {
   STORAGE_KEY: "founderOS.state.v1",
   SCHEMA_VERSION: 31,
@@ -2096,6 +2111,7 @@ function defaultUiState(){
     notesPinnedOnly: false,
     notesTypeFilter: "all", // all | meeting | personal
     emailSelectedContactId: null,
+    terminologyMode: "founder", // "founder" | "pm" — see the TERMINOLOGY object near the top of this script
     emailActiveAccountId: null, // null = the main Google connection; otherwise an id from integrations.emailAccounts
     knowledgeFilter: "",
     knowledgeFilterCategory: "all",
@@ -4628,7 +4644,7 @@ let assistantSending = false;
 
 function buildAssistantContext(){
   const lines = [];
-  lines.push(`You are the in-app assistant inside Founder OS, a personal operating system for running one or more businesses. Be direct, concise, and genuinely useful — this is a real founder running a real business, not a demo.`);
+  lines.push(`You are the in-app assistant inside Founder OS, a personal operating system for running one or more ${T("businesses")}. Be direct, concise, and genuinely useful — this is a real person running a real ${T("business")}, not a demo.`);
   if(STATE.founder && STATE.founder.name){
     lines.push(`Founder: ${STATE.founder.name}. Current season goal: ${STATE.season ? STATE.season.name : "not set"}.`);
   }
@@ -5212,7 +5228,7 @@ function openVoiceReviewModal(idea, projectMatch, businessMatch){
            <button type="button" class="btn btn-primary" id="voiceConfirmAssignBtn">Assign to ${escapeHtml(projectMatch.name)}</button>`
         : businessMatch
           ? `<button type="button" class="btn btn-ghost" data-modal-close>Leave in Inbox</button>
-             <button type="button" class="btn btn-primary" id="voiceConfirmPickBtn">Pick a project under ${escapeHtml(biz ? biz.name : "this business")}</button>`
+             <button type="button" class="btn btn-primary" id="voiceConfirmPickBtn">Pick a project under ${escapeHtml(biz ? biz.name : `this ${T("business")}`)}</button>`
           : `<button type="button" class="btn btn-primary" data-modal-close>Done</button>`}
     </div>
   `, (root) => {
@@ -5475,7 +5491,7 @@ function stopVentureRecording(){
 }
 
 async function handleVentureRecorded(blob, mimeType){
-  showToast("Captured — figuring out the business and missions…");
+  showToast(`Captured — figuring out the ${T("business")} and missions…`);
   let audioBase64;
   try{
     audioBase64 = await blobToBase64(blob);
@@ -5543,12 +5559,12 @@ function openVentureReviewModal(data){
       <div style="font-size:12.5px;color:var(--text-secondary);max-height:80px;overflow-y:auto;">${escapeHtml(data.transcript)}</div>
     </div>
     <div class="field">
-      <label class="field-label">Business</label>
+      <label class="field-label">${T("Business")}</label>
       <div class="tab-group" style="margin-bottom:8px;">
-        <button type="button" class="tab-btn ${!useExisting ? "active" : ""}" data-venture-biz-mode="new">New business</button>
-        <button type="button" class="tab-btn ${useExisting ? "active" : ""}" data-venture-biz-mode="existing">Existing business</button>
+        <button type="button" class="tab-btn ${!useExisting ? "active" : ""}" data-venture-biz-mode="new">New ${T("business")}</button>
+        <button type="button" class="tab-btn ${useExisting ? "active" : ""}" data-venture-biz-mode="existing">Existing ${T("business")}</button>
       </div>
-      <input class="field-input" id="ventureNewBizName" value="${escapeHtml(data.newBusinessName || "")}" placeholder="Business name" style="display:${!useExisting ? "block" : "none"};" />
+      <input class="field-input" id="ventureNewBizName" value="${escapeHtml(data.newBusinessName || "")}" placeholder="${T("Business")} name" style="display:${!useExisting ? "block" : "none"};" />
       <select class="field-select" id="ventureExistingBiz" style="display:${useExisting ? "block" : "none"};width:100%;">${bizOptions}</select>
     </div>
     <div class="field">
@@ -5579,10 +5595,10 @@ function openVentureReviewModal(data){
       if(bizMode === "existing"){
         const bizId = root.querySelector("#ventureExistingBiz").value;
         business = businessById(bizId);
-        if(!business){ showToast("Pick a business first"); return; }
+        if(!business){ showToast(`Pick a ${T("business")} first`); return; }
       }else{
         const name = root.querySelector("#ventureNewBizName").value.trim();
-        if(!name){ showToast("Give the new business a name first"); return; }
+        if(!name){ showToast(`Give the new ${T("business")} a name first`); return; }
         business = createBusiness({ name, status: "ontrack" });
       }
 
@@ -5882,15 +5898,15 @@ function openQuickFocusPickerModal(){
       <button class="modal-close" data-modal-close>${icon("close")}</button>
     </div>
     <div class="field">
-      <label class="field-label">Business</label>
+      <label class="field-label">${T("Business")}</label>
       <select class="field-select" id="qfBusiness">
-        <option value="">Choose a business…</option>
+        <option value="">Choose a ${T("business")}…</option>
         ${businesses.map(b => `<option value="${b.id}">${escapeHtml(b.name)}</option>`).join("")}
       </select>
     </div>
     <div class="field">
       <label class="field-label">Mission</label>
-      <select class="field-select" id="qfMission" disabled><option value="">Pick a business first…</option></select>
+      <select class="field-select" id="qfMission" disabled><option value="">Pick a ${T("business")} first…</option></select>
     </div>
     <div class="modal-footer">
       <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
@@ -5904,7 +5920,7 @@ function openQuickFocusPickerModal(){
       const missions = STATE.missions.filter(m => m.status === "active" && m.businessId === bizSelect.value);
       missionSelect.innerHTML = missions.length
         ? `<option value="">Choose a mission…</option>` + missions.map(m => `<option value="${m.id}">${escapeHtml(m.title)}</option>`).join("")
-        : `<option value="">No active missions for this business</option>`;
+        : `<option value="">No active missions for this ${T("business")}</option>`;
       missionSelect.disabled = missions.length === 0;
       startBtn.disabled = true;
     });
@@ -6594,7 +6610,7 @@ function renderPortfolio(){
       <div class="toolbar">
         <div>${statusPill(focusBiz.status)}</div>
         <div class="toolbar-filters">
-          <button class="btn btn-ghost btn-sm" data-action="edit-business" data-id="${focusBiz.id}">${icon("edit")} Edit business</button>
+          <button class="btn btn-ghost btn-sm" data-action="edit-business" data-id="${focusBiz.id}">${icon("edit")} Edit ${T("business")}</button>
           <button class="btn btn-primary btn-sm" data-action="new-project" data-bizid="${focusBiz.id}">${icon("plus")} New project</button>
         </div>
       </div>
@@ -6620,7 +6636,7 @@ function renderPortfolio(){
       </div>
       <div style="display:flex; gap:6px; margin-top:2px;">
         <button class="btn btn-ghost btn-sm" data-action="edit-business" data-id="${biz.id}" style="flex:1;">${icon("edit")} Edit</button>
-        <button class="icon-btn" data-action="delete-business" data-id="${biz.id}" title="Delete business">${icon("trash")}</button>
+        <button class="icon-btn" data-action="delete-business" data-id="${biz.id}" title="Delete ${T("business")}">${icon("trash")}</button>
       </div>
     </div>`;
   }).join("");
@@ -6628,14 +6644,14 @@ function renderPortfolio(){
   return `
   <div class="view-enter">
     <div class="toolbar">
-      <div class="view-desc" style="margin:0;">${STATE.businesses.length} businesses in the portfolio</div>
+      <div class="view-desc" style="margin:0;">${STATE.businesses.length} ${T("businesses")} in the portfolio</div>
       <div style="display:flex;gap:8px;">
-        <button class="btn btn-ghost" id="ventureBrainDumpBtn">${icon("mic")} ${ventureRecording ? "Recording… tap to finish" : "Brain-dump a business/project"}</button>
-        <button class="btn btn-primary" data-action="new-business">${icon("plus")} New business</button>
+        <button class="btn btn-ghost" id="ventureBrainDumpBtn">${icon("mic")} ${ventureRecording ? "Recording… tap to finish" : `Brain-dump a ${T("business")}/project`}</button>
+        <button class="btn btn-primary" data-action="new-business">${icon("plus")} New ${T("business")}</button>
       </div>
     </div>
     <div class="grid dash-grid">
-      ${cards || `<div class="col-12">${emptyState("layers", "No businesses yet", "Add your first business to start building out your portfolio.")}</div>`}
+      ${cards || `<div class="col-12">${emptyState("layers", `No ${T("businesses")} yet`, `Add your first ${T("business")} to start building out your portfolio.`)}</div>`}
     </div>
   </div>`;
 }
@@ -6675,7 +6691,7 @@ function renderProjects(){
     <div class="toolbar">
       <div class="toolbar-filters">
         <select class="filter-select" data-action="filter-projects-business">
-          <option value="all">All businesses</option>
+          <option value="all">All ${T("businesses")}</option>
           ${bizOptions}
         </select>
       </div>
@@ -6752,7 +6768,7 @@ function renderMissions(){
     <div class="toolbar" data-tour="missions-toolbar">
       <div class="toolbar-filters">
         <select class="filter-select" data-action="filter-missions-business">
-          <option value="all">All businesses</option>
+          <option value="all">All ${T("businesses")}</option>
           ${bizOptions}
         </select>
         <select class="filter-select" data-action="filter-missions-status">
@@ -6843,7 +6859,7 @@ function renderGoals(){
       <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:0.04em;color:var(--text-tertiary);margin:var(--space-4) 0 var(--space-2);">One-time goals</h3>
       ${oneShotGoals.map(renderGoalCard).join("")}` : ""}
 
-    ${!active.length ? `<div class="card glass col-12">${emptyState("flag", "No goals set yet", "Set a SMART goal — specific, measurable, tied to a real business, with a deadline — and check in daily or weekly to build an honest streak.")}</div>` : ""}
+    ${!active.length ? `<div class="card glass col-12">${emptyState("flag", "No goals set yet", `Set a SMART goal — specific, measurable, tied to a real ${T("business")}, with a deadline — and check in daily or weekly to build an honest streak.`)}</div>` : ""}
 
     ${completed.length ? `
       <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:0.04em;color:var(--text-tertiary);margin:var(--space-4) 0 var(--space-2);">Completed / abandoned</h3>
@@ -6895,7 +6911,7 @@ function openGoalModal(goal){
       </div>
       <div class="field-row">
         <div class="field">
-          <label class="field-label">Relevant — which business?</label>
+          <label class="field-label">Relevant — which ${T("business")}?</label>
           <select class="field-select" name="businessId"><option value="">— Not tied to one —</option>${bizOptions}</select>
         </div>
         <div class="field">
@@ -7151,12 +7167,12 @@ function openBusinessModal(business){
   const b = business || { name: "", status: "ontrack" };
   openModal(`
     <div class="modal-header">
-      <div class="modal-title">${isEdit ? "Edit business" : "New business"}</div>
+      <div class="modal-title">${isEdit ? `Edit ${T("business")}` : `New ${T("business")}`}</div>
       <button class="modal-close" data-modal-close>${icon("close")}</button>
     </div>
     <form id="businessForm">
       <div class="field">
-        <label class="field-label">Business name</label>
+        <label class="field-label">${T("Business")} name</label>
         <input class="field-input" name="name" required value="${escapeHtml(b.name)}" placeholder="e.g. Promo Plays" />
       </div>
       <div class="field">
@@ -7169,16 +7185,16 @@ function openBusinessModal(business){
       </div>
       <div class="modal-footer">
         <button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>
-        <button type="submit" class="btn btn-primary">${isEdit ? "Save changes" : "Create business"}</button>
+        <button type="submit" class="btn btn-primary">${isEdit ? "Save changes" : `Create ${T("business")}`}</button>
       </div>
     </form>
   `, (root) => {
     root.querySelector("#businessForm").addEventListener("submit", (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
-      const data = { name: fd.get("name").trim() || "Untitled Business", status: fd.get("status") };
-      if(isEdit){ updateBusiness(b.id, data); showToast("Business updated"); }
-      else{ createBusiness(data); showToast("Business created"); }
+      const data = { name: fd.get("name").trim() || `Untitled ${T("Business")}`, status: fd.get("status") };
+      if(isEdit){ updateBusiness(b.id, data); showToast(`${T("Business")} updated`); }
+      else{ createBusiness(data); showToast(`${T("Business")} created`); }
       closeModal();
       renderApp();
     });
@@ -7200,7 +7216,7 @@ function openProjectModal(project, presetBusinessId, presetClientContactId){
       </div>
       <div class="field-row">
         <div class="field">
-          <label class="field-label">Business</label>
+          <label class="field-label">${T("Business")}</label>
           <select class="field-select" name="businessId">${businessOptionsHtml(p.businessId)}</select>
         </div>
         <div class="field">
@@ -7590,7 +7606,7 @@ function renderOpportunities(){
     <div class="toolbar">
       <div class="toolbar-filters">
         <select class="filter-select" data-action="filter-opportunities-business">
-          <option value="all">All businesses</option>
+          <option value="all">All ${T("businesses")}</option>
           ${bizOptions}
         </select>
       </div>
@@ -7617,7 +7633,7 @@ function openOpportunityModal(opportunity){
       </div>
       <div class="field-row">
         <div class="field">
-          <label class="field-label">Business</label>
+          <label class="field-label">${T("Business")}</label>
           <select class="field-select" name="businessId">${businessOptionsHtml(o.businessId)}</select>
         </div>
         <div class="field">
@@ -7713,7 +7729,7 @@ function renderContacts(){
       <button class="btn btn-primary" data-action="new-contact">${icon("plus")} New contact</button>
     </div>
     <div class="card glass col-12">
-      ${rows || emptyState("users", "No contacts yet", "Add the people and relationships that matter to your businesses — clients, team, partners, family.")}
+      ${rows || emptyState("users", "No contacts yet", `Add the people and relationships that matter to your ${T("businesses")} — clients, team, partners, family.`)}
     </div>
   </div>`;
 }
@@ -7942,7 +7958,7 @@ function openContactModal(contact){
           </select>
         </div>
         <div class="field">
-          <label class="field-label">Business (optional)</label>
+          <label class="field-label">${T("Business")} (optional)</label>
           <select class="field-select" name="businessId">
             <option value="">None</option>
             ${businessOptionsHtml(c.businessId)}
@@ -8577,7 +8593,7 @@ function openNoteModal(note){
       <div id="noteMeetingFields" style="display:${n.type === "meeting" ? "block" : "none"};">
         <div class="field-row">
           <div class="field">
-            <label class="field-label">Business (optional)</label>
+            <label class="field-label">${T("Business")} (optional)</label>
             <select class="field-select" name="businessId"><option value="">—</option>${bizOptions}</select>
           </div>
           <div class="field">
@@ -8884,7 +8900,7 @@ function getCommandList(){
     commands.push({ label: `Go to ${item.label}`, hint: "Navigate", run: () => { closeModal(); navigateTo(item.id); } });
   });
   commands.push(
-    { label: "New Business", hint: "Create", run: () => { closeModal(); navigateTo("portfolio"); openBusinessModal(null); } },
+    { label: `New ${T("Business")}`, hint: "Create", run: () => { closeModal(); navigateTo("portfolio"); openBusinessModal(null); } },
     { label: "New Project", hint: "Create", run: () => { closeModal(); navigateTo("projects"); openProjectModal(null); } },
     { label: "New Mission", hint: "Create", run: () => { closeModal(); navigateTo("missions"); openMissionModal(null); } },
     { label: "New Opportunity", hint: "Create", run: () => { closeModal(); navigateTo("opportunities"); openOpportunityModal(null); } },
@@ -9018,7 +9034,7 @@ function renderHelpQuickStartTab(){
     <h4>What should I build today?</h4>
     <p>That's the one question this console exists to answer. Every morning, the Dashboard opens with a CEO Briefing that pulls together your season, your highest-impact mission, and anything that needs attention.</p>
     <h4>The hierarchy</h4>
-    <p>Portfolio → Business → Projects → Missions → Tasks. Everything lives under a Mission, not a flat to-do list — missions carry priority, impact, and estimated time, so you can tell what's worth your first focus block.</p>
+    <p>Portfolio → ${T("Business")} → Projects → Missions → Tasks. Everything lives under a Mission, not a flat to-do list — missions carry priority, impact, and estimated time, so you can tell what's worth your first focus block.</p>
     <h4>Focus Mode</h4>
     <p>Press Start on any mission and everything else disappears — current mission, current task, elapsed time, remaining time, and the next milestone.</p>
     <h4>Video tutorials</h4>
@@ -9200,6 +9216,16 @@ function renderSettings(){
               <div class="settings-row-desc">Starts every session with the compact, icon-only sidebar.</div>
             </div>
             <div class="toggle ${ui.sidebarCollapsed ? "on" : ""}" data-action="toggle-sidebar-default"><div class="toggle-knob"></div></div>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-row-label">Terminology</div>
+              <div class="settings-row-desc">"Founder" says Business/Businesses throughout. "Project Manager" says Client/Clients instead — same structure underneath either way.</div>
+            </div>
+            <select class="field-select" id="terminologyModeSelect" style="max-width:200px;">
+              <option value="founder" ${ui.terminologyMode !== "pm" ? "selected" : ""}>Founder (Business)</option>
+              <option value="pm" ${ui.terminologyMode === "pm" ? "selected" : ""}>Project Manager (Client)</option>
+            </select>
           </div>
         </div>
       </div>
@@ -9950,7 +9976,7 @@ function currentViewDesc(){
   const descs = {
     dashboard: "What should I build today?",
     assistant: "Ask for help — it can see your real data.",
-    portfolio: "Every business you're running, in one place.",
+    portfolio: `Every ${T("business")} you're running, in one place.`,
     projects: "The work in flight across the whole portfolio.",
     missions: "The highest-leverage moves, broken into tasks.",
     templates: "Recurring work, saved once, reused every time.",
@@ -9958,7 +9984,7 @@ function currentViewDesc(){
     calendarsync: "Your Google and Microsoft calendars, live in one place.",
     focus: "One mission. No distractions.",
     opportunities: "From first contact to closed and delivered.",
-    contacts: "The people behind the businesses — not a messaging app, a memory.",
+    contacts: `The people behind the ${T("businesses")} — not a messaging app, a memory.`,
     ideavault: "Capture without breaking focus.",
     journal: "Three questions, every evening.",
     notes: "Quick reference, not a to-do — meeting recaps, ideas, anything worth finding again.",
@@ -10219,6 +10245,14 @@ function bindEvents(){
   if(sidebarDefaultToggle){
     sidebarDefaultToggle.addEventListener("click", () => {
       STATE.ui.sidebarCollapsed = !STATE.ui.sidebarCollapsed;
+      saveState();
+      renderApp();
+    });
+  }
+  const terminologySelect = document.getElementById("terminologyModeSelect");
+  if(terminologySelect){
+    terminologySelect.addEventListener("change", () => {
+      STATE.ui.terminologyMode = terminologySelect.value;
       saveState();
       renderApp();
     });
